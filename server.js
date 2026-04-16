@@ -5,13 +5,13 @@ const API_TOKEN = process.env.CLICKUP_API_TOKEN;
 const PORT = process.env.PORT || 3000;
 
 const LIST_IDS = [
-  '901712935558', // Clinical SOPs
-  '901712935562', // Staff Onboarding
-  '901712935566', // Referral Pipeline
-  '901712935573', // KPI Tracking
-  '901712935575', // HR & Performance
-  '901712935581', // Financial Model
-  '901708395565', // Operations (main ops list)
+  '901712935558',
+  '901712935562',
+  '901712935566',
+  '901712935573',
+  '901712935575',
+  '901712935581',
+  '901708395565',
 ];
 
 const PILLAR_MAP = {
@@ -27,99 +27,107 @@ function classifyOpsTask(name) {
   const n = name.toLowerCase();
   if (['sop','consent forms','intake doc','admission criteria','insurance verif','orientation protocol','iddt','psychiatric eval','clinical team sync','mat manage','crisis protocol','phase advance','search and drug','off-site pass','incident report','discharge planning','billing submission','medical records','r501','dali','treatment plan','psych eval','stabilization','warm handoff'].some(k => n.includes(k))) return 'sops';
   if (['hiring process','transportation position','transportation staff','find transportation','job desc','compensation','background','credential','onboard','thinkific','gusto','simplepractice'].some(k => n.includes(k))) return 'onboard';
-  if (['google','facebook','outreach','field outreach','matt dedicated','referral','pipeline','waitlist','hospital','therapist'].some(k => n.includes(k))) return 'referral';
-  if (['kpi','revenue','financial dashboard','billing','collections','ar aging','payroll','payer'].some(k => n.includes(k))) return 'kpi';
+  if (['google','facebook','outreach','field outreach','referral','pipeline','waitlist','hospital','therapist'].some(k => n.includes(k))) return 'referral';
+  if (['kpi','financial dashboard','collections','ar aging','payroll','payer'].some(k => n.includes(k))) return 'kpi';
   if (['financial dashboard','credentialing'].some(k => n.includes(k))) return 'fin';
   return 'hr';
 }
 
-function fetchClickUp(path) {
+function clickupRequest(method, path, body) {
   return new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
     const options = {
       hostname: 'api.clickup.com',
       path: `/api/v2${path}`,
-      method: 'GET',
-      headers: { 'Authorization': API_TOKEN, 'Content-Type': 'application/json' }
+      method,
+      headers: {
+        'Authorization': API_TOKEN,
+        'Content-Type': 'application/json',
+        ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {})
+      }
     };
     const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
+      let responseData = '';
+      res.on('data', chunk => responseData += chunk);
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
+        try { resolve(JSON.parse(responseData)); }
         catch(e) { reject(e); }
       });
     });
     req.on('error', reject);
+    if (data) req.write(data);
     req.end();
   });
 }
 
 async function getAllTasks() {
   const pillars = { sops: [], onboard: [], referral: [], kpi: [], hr: [], fin: [] };
-
   for (const listId of LIST_IDS) {
     try {
-      const data = await fetchClickUp(`/list/${listId}/task?include_closed=true&subtasks=true`);
+      const data = await clickupRequest('GET', `/list/${listId}/task?include_closed=true&subtasks=true`);
       const tasks = (data.tasks || []).map(t => ({
         id: t.id,
         name: t.name,
         status: t.status?.status || 'to do',
-        assignees: (t.assignees || []).map(a => a.username || a.email || 'Unknown'),
+        assignees: (t.assignees || []).map(a => ({ id: a.id, username: a.username, email: a.email })),
         priority: t.priority?.priority || null,
         url: t.url,
         due_date: t.due_date,
         list: t.list?.name
       }));
-
       if (PILLAR_MAP[listId]) {
         pillars[PILLAR_MAP[listId]].push(...tasks);
       } else {
-        // Ops list — classify each task
-        tasks.forEach(t => {
-          const pillar = classifyOpsTask(t.name);
-          pillars[pillar].push(t);
-        });
+        tasks.forEach(t => { pillars[classifyOpsTask(t.name)].push(t); });
       }
     } catch(e) {
       console.error(`Error fetching list ${listId}:`, e.message);
     }
   }
-
   return pillars;
 }
 
-// Simple in-memory cache — refresh every 5 minutes
+// Cache
 let cache = null;
 let cacheTime = 0;
 const CACHE_TTL = 5 * 60 * 1000;
 
-async function getCachedTasks() {
+async function getCachedTasks(force) {
   const now = Date.now();
-  if (cache && (now - cacheTime) < CACHE_TTL) return cache;
+  if (!force && cache && (now - cacheTime) < CACHE_TTL) return cache;
   console.log('Fetching fresh data from ClickUp...');
   cache = await getAllTasks();
   cacheTime = now;
   return cache;
 }
 
+// Parse request body
+function parseBody(req) {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try { resolve(JSON.parse(body)); }
+      catch(e) { resolve({}); }
+    });
+  });
+}
+
 const server = http.createServer(async (req, res) => {
-  // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(200);
-    res.end();
-    return;
-  }
+  if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
-  if (req.url === '/tasks' || req.url === '/tasks?refresh=true') {
+  const url = req.url.split('?')[0];
+  const query = req.url.includes('?') ? req.url.split('?')[1] : '';
+  const force = query.includes('refresh=true');
+
+  // GET /tasks — fetch all tasks
+  if (req.method === 'GET' && url === '/tasks') {
     try {
-      if (req.url.includes('refresh=true')) {
-        cache = null; // force refresh
-      }
-      const tasks = await getCachedTasks();
+      const tasks = await getCachedTasks(force);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, data: tasks, cached_at: new Date(cacheTime).toISOString() }));
     } catch(e) {
@@ -129,9 +137,56 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.url === '/health') {
+  // POST /assign — assign a task to a user in ClickUp
+  if (req.method === 'POST' && url === '/assign') {
+    try {
+      const body = await parseBody(req);
+      const { task_id, assignee_id, remove } = body;
+      if (!task_id) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'task_id required' }));
+        return;
+      }
+      const payload = remove
+        ? { rem_assignees: [assignee_id] }
+        : { assignees: [assignee_id] };
+      const result = await clickupRequest('PUT', `/task/${task_id}`, payload);
+      // Bust cache so next fetch is fresh
+      cache = null;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, task: result }));
+    } catch(e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: e.message }));
+    }
+    return;
+  }
+
+  // POST /status — update task status in ClickUp
+  if (req.method === 'POST' && url === '/status') {
+    try {
+      const body = await parseBody(req);
+      const { task_id, status } = body;
+      if (!task_id || !status) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'task_id and status required' }));
+        return;
+      }
+      const result = await clickupRequest('PUT', `/task/${task_id}`, { status });
+      cache = null;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, task: result }));
+    } catch(e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: e.message }));
+    }
+    return;
+  }
+
+  // GET /health
+  if (req.method === 'GET' && url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'Bright Horizons Command Center API' }));
+    res.end(JSON.stringify({ status: 'ok', service: 'Bright Horizons Command Center API', token_set: !!API_TOKEN }));
     return;
   }
 
@@ -143,3 +198,4 @@ server.listen(PORT, () => {
   console.log(`Bright Horizons API running on port ${PORT}`);
   if (!API_TOKEN) console.warn('WARNING: CLICKUP_API_TOKEN not set');
 });
+  
