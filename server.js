@@ -87,7 +87,6 @@ async function getAllTasks() {
   return pillars;
 }
 
-// Cache
 let cache = null;
 let cacheTime = 0;
 const CACHE_TTL = 5 * 60 * 1000;
@@ -101,7 +100,6 @@ async function getCachedTasks(force) {
   return cache;
 }
 
-// Parse request body
 function parseBody(req) {
   return new Promise((resolve) => {
     let body = '';
@@ -113,31 +111,29 @@ function parseBody(req) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
-  const allowedOrigins = [
-    'https://brighthorizonshomedashboard.com',
-    'http://brighthorizonshomedashboard.com',
-    'https://polite-quokka-1a3d8a.netlify.app',
-    'http://localhost:3000',
-    'http://127.0.0.1:5500'
-  ];
-  const origin = req.headers.origin;
-  if (origin && allowedOrigins.some(o => origin.includes(o.replace('https://','').replace('http://',''))) ) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-  } else {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-  }
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
+// Apply CORS headers to every single response
+function setCORS(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization, Origin');
+  res.setHeader('Access-Control-Max-Age', '86400');
+}
 
-  if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
+const server = http.createServer(async (req, res) => {
+  // Always set CORS first — before anything else
+  setCORS(res);
+
+  // Handle preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
 
   const url = req.url.split('?')[0];
   const query = req.url.includes('?') ? req.url.split('?')[1] : '';
   const force = query.includes('refresh=true');
 
-  // GET /tasks — fetch all tasks
   if (req.method === 'GET' && url === '/tasks') {
     try {
       const tasks = await getCachedTasks(force);
@@ -150,21 +146,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST /assign — assign a task to a user in ClickUp
   if (req.method === 'POST' && url === '/assign') {
     try {
       const body = await parseBody(req);
-      const { task_id, assignee_id, remove } = body;
+      const { task_id, assignee_id } = body;
       if (!task_id) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false, error: 'task_id required' }));
         return;
       }
-      const payload = remove
-        ? { rem_assignees: [assignee_id] }
-        : { assignees: [assignee_id] };
+      const payload = assignee_id ? { assignees: [assignee_id] } : { assignees: [] };
       const result = await clickupRequest('PUT', `/task/${task_id}`, payload);
-      // Bust cache so next fetch is fresh
       cache = null;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, task: result }));
@@ -175,7 +167,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST /status — update task status in ClickUp
   if (req.method === 'POST' && url === '/status') {
     try {
       const body = await parseBody(req);
@@ -196,15 +187,14 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // GET /health
   if (req.method === 'GET' && url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', service: 'Bright Horizons Command Center API', token_set: !!API_TOKEN }));
     return;
   }
 
-  res.writeHead(404);
-  res.end('Not found');
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
 });
 
 server.listen(PORT, () => {
