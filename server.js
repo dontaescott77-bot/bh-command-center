@@ -114,9 +114,22 @@ function parseBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  const allowedOrigins = [
+    'https://brighthorizonshomedashboard.com',
+    'http://brighthorizonshomedashboard.com',
+    'https://polite-quokka-1a3d8a.netlify.app',
+    'http://localhost:3000',
+    'http://127.0.0.1:5500'
+  ];
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.some(o => origin.includes(o.replace('https://','').replace('http://',''))) ) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
 
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
@@ -198,4 +211,3 @@ server.listen(PORT, () => {
   console.log(`Bright Horizons API running on port ${PORT}`);
   if (!API_TOKEN) console.warn('WARNING: CLICKUP_API_TOKEN not set');
 });
-  
