@@ -1,0 +1,12 @@
+{
+  "name": "bh-command-center-api",
+  "version": "1.0.0",
+  "description": "Bright Horizons Command Center API — ClickUp live sync",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
