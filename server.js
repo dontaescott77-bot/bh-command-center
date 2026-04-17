@@ -5,22 +5,20 @@ const API_TOKEN = process.env.CLICKUP_API_TOKEN;
 const PORT = process.env.PORT || 3000;
 
 const LIST_IDS = [
-  '901712935558',
-  '901712935562',
-  '901712935566',
-  '901712935573',
-  '901712935575',
-  '901712935581',
-  '901708395565',
+  '901712935558','901712935562','901712935566',
+  '901712935573','901712935575','901712935581','901708395565',
 ];
 
 const PILLAR_MAP = {
-  '901712935558': 'sops',
-  '901712935562': 'onboard',
-  '901712935566': 'referral',
-  '901712935573': 'kpi',
-  '901712935575': 'hr',
-  '901712935581': 'fin',
+  '901712935558':'sops','901712935562':'onboard','901712935566':'referral',
+  '901712935573':'kpi','901712935575':'hr','901712935581':'fin',
+};
+
+// Shared state — persists in memory on the server, same for all users
+let sharedState = {
+  census: 4,
+  kpi: {},
+  fin: {}
 };
 
 function classifyOpsTask(name) {
@@ -61,19 +59,16 @@ function clickupRequest(method, path, body) {
 }
 
 async function getAllTasks() {
-  const pillars = { sops: [], onboard: [], referral: [], kpi: [], hr: [], fin: [] };
+  const pillars = { sops:[], onboard:[], referral:[], kpi:[], hr:[], fin:[] };
   for (const listId of LIST_IDS) {
     try {
       const data = await clickupRequest('GET', `/list/${listId}/task?include_closed=true&subtasks=true`);
       const tasks = (data.tasks || []).map(t => ({
-        id: t.id,
-        name: t.name,
+        id: t.id, name: t.name,
         status: t.status?.status || 'to do',
         assignees: (t.assignees || []).map(a => ({ id: a.id, username: a.username, email: a.email })),
         priority: t.priority?.priority || null,
-        url: t.url,
-        due_date: t.due_date,
-        list: t.list?.name
+        url: t.url, due_date: t.due_date, list: t.list?.name
       }));
       if (PILLAR_MAP[listId]) {
         pillars[PILLAR_MAP[listId]].push(...tasks);
@@ -111,7 +106,6 @@ function parseBody(req) {
   });
 }
 
-// Apply CORS headers to every single response
 function setCORS(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
@@ -120,10 +114,8 @@ function setCORS(res) {
 }
 
 const server = http.createServer(async (req, res) => {
-  // Always set CORS first — before anything else
   setCORS(res);
 
-  // Handle preflight
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
@@ -134,6 +126,7 @@ const server = http.createServer(async (req, res) => {
   const query = req.url.includes('?') ? req.url.split('?')[1] : '';
   const force = query.includes('refresh=true');
 
+  // GET tasks
   if (req.method === 'GET' && url === '/tasks') {
     try {
       const tasks = await getCachedTasks(force);
@@ -146,6 +139,32 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // GET shared state — census, kpi, fin data
+  if (req.method === 'GET' && url === '/state') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, state: sharedState }));
+    return;
+  }
+
+  // POST shared state — only owner can update census
+  if (req.method === 'POST' && url === '/state') {
+    try {
+      const body = await parseBody(req);
+      // Merge incoming state with existing state
+      if (body.census !== undefined) sharedState.census = body.census;
+      if (body.kpi) sharedState.kpi = { ...sharedState.kpi, ...body.kpi };
+      if (body.fin) sharedState.fin = { ...sharedState.fin, ...body.fin };
+      console.log('Shared state updated:', JSON.stringify(sharedState));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, state: sharedState }));
+    } catch(e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: e.message }));
+    }
+    return;
+  }
+
+  // POST assign
   if (req.method === 'POST' && url === '/assign') {
     try {
       const body = await parseBody(req);
@@ -167,6 +186,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // POST status
   if (req.method === 'POST' && url === '/status') {
     try {
       const body = await parseBody(req);
@@ -187,6 +207,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // GET health
   if (req.method === 'GET' && url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', service: 'Bright Horizons Command Center API', token_set: !!API_TOKEN }));
