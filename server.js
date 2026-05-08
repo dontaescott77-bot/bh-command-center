@@ -14,6 +14,16 @@ const PILLAR_MAP = {
   '901712935573':'kpi','901712935575':'hr','901712935581':'fin',
 };
 
+// Partner Outreach Pipeline (Neshel's partner tracking)
+const PARTNER_LIST_ID = '901713563582';
+const PARTNER_FIELDS = {
+  contact_name: '0f640183-dec2-40ec-8fa0-ba477851c5a7',
+  contact_info: '070cefed-1161-43b4-b794-4cb0782d4612',
+  partner_type: 'f80aafb4-13db-4d53-94df-c4e8fa840634',
+  last_touch:   '175e6d67-be03-46c1-a852-4db738fb593c',
+  next_action:  '6f43c5f3-b426-47bb-bae0-84a43707a5e8',
+};
+
 // Shared state — persists in memory on the server, same for all users
 let sharedState = {
   census: 4,
@@ -201,6 +211,57 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, task: result }));
     } catch(e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: e.message }));
+    }
+    return;
+  }
+
+  // POST outreach — create new partner outreach task in the Partner Outreach Pipeline list
+  if (req.method === 'POST' && url === '/outreach') {
+    try {
+      const body = await parseBody(req);
+      const { partner_name, status, contact_name, contact_info, partner_type, last_touch, next_action, notes } = body;
+
+      if (!partner_name || !partner_name.trim()) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'partner_name is required' }));
+        return;
+      }
+
+      // Only include custom fields that have values
+      const custom_fields = [];
+      if (contact_name) custom_fields.push({ id: PARTNER_FIELDS.contact_name, value: contact_name });
+      if (contact_info) custom_fields.push({ id: PARTNER_FIELDS.contact_info, value: contact_info });
+      if (partner_type) custom_fields.push({ id: PARTNER_FIELDS.partner_type, value: partner_type });
+      if (last_touch)   custom_fields.push({ id: PARTNER_FIELDS.last_touch,   value: parseInt(last_touch) });
+      if (next_action)  custom_fields.push({ id: PARTNER_FIELDS.next_action,  value: next_action });
+
+      const payload = {
+        name: partner_name.trim(),
+        description: notes || '',
+        ...(status ? { status } : {}),
+        ...(custom_fields.length > 0 ? { custom_fields } : {})
+      };
+
+      const result = await clickupRequest('POST', `/list/${PARTNER_LIST_ID}/task`, payload);
+
+      // ClickUp returns errors in the body, not via HTTP status — check explicitly
+      if (result.err || result.errors) {
+        console.error('ClickUp rejected outreach create:', JSON.stringify(result));
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: result.err || JSON.stringify(result.errors) }));
+        return;
+      }
+
+      console.log(`Outreach created: ${result.id} — ${result.name}`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        task: { id: result.id, name: result.name, url: result.url, status: result.status?.status }
+      }));
+    } catch(e) {
+      console.error('Outreach create error:', e.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: false, error: e.message }));
     }
