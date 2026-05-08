@@ -105,6 +105,50 @@ async function getCachedTasks(force) {
   return cache;
 }
 
+// Outreach cache (separate from main task cache, shorter TTL)
+let outreachCache = null;
+let outreachCacheTime = 0;
+const OUTREACH_TTL = 30 * 1000;
+
+async function getOutreachTasks() {
+  const data = await clickupRequest('GET', `/list/${PARTNER_LIST_ID}/task?include_closed=true&subtasks=false`);
+  return (data.tasks || []).map(t => {
+    const cf = { contact_name: '', contact_info: '', partner_type: '', partner_type_id: null, last_touch: null, next_action: '' };
+    (t.custom_fields || []).forEach(f => {
+      if (f.id === PARTNER_FIELDS.contact_name) cf.contact_name = f.value || '';
+      else if (f.id === PARTNER_FIELDS.contact_info) cf.contact_info = f.value || '';
+      else if (f.id === PARTNER_FIELDS.partner_type) {
+        cf.partner_type_id = f.value || null;
+        if (f.value !== undefined && f.value !== null && f.type_config && Array.isArray(f.type_config.options)) {
+          const opt = f.type_config.options.find(o => o.id === f.value || o.orderindex === f.value);
+          cf.partner_type = opt ? opt.name : '';
+        }
+      }
+      else if (f.id === PARTNER_FIELDS.last_touch) cf.last_touch = f.value ? parseInt(f.value) : null;
+      else if (f.id === PARTNER_FIELDS.next_action) cf.next_action = f.value || '';
+    });
+    return {
+      id: t.id,
+      name: t.name,
+      status: t.status?.status || 'Cold',
+      url: t.url,
+      date_created: t.date_created,
+      date_updated: t.date_updated,
+      description: t.description || '',
+      ...cf
+    };
+  });
+}
+
+async function getCachedOutreach(force) {
+  const now = Date.now();
+  if (!force && outreachCache && (now - outreachCacheTime) < OUTREACH_TTL) return outreachCache;
+  console.log('Fetching outreach from ClickUp...');
+  outreachCache = await getOutreachTasks();
+  outreachCacheTime = now;
+  return outreachCache;
+}
+
 function parseBody(req) {
   return new Promise((resolve) => {
     let body = '';
@@ -217,6 +261,20 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // GET outreach — fetch all tasks from Partner Outreach Pipeline (with custom fields parsed)
+  if (req.method === 'GET' && url === '/outreach') {
+    try {
+      const tasks = await getCachedOutreach(force);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, tasks, cached_at: new Date(outreachCacheTime).toISOString() }));
+    } catch(e) {
+      console.error('Outreach fetch error:', e.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: e.message }));
+    }
+    return;
+  }
+
   // POST outreach — create new partner outreach task in the Partner Outreach Pipeline list
   if (req.method === 'POST' && url === '/outreach') {
     try {
@@ -253,6 +311,10 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ success: false, error: result.err || JSON.stringify(result.errors) }));
         return;
       }
+
+      // Invalidate outreach cache so the next GET picks up the new task
+      outreachCache = null;
+      outreachCacheTime = 0;
 
       console.log(`Outreach created: ${result.id} — ${result.name}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
