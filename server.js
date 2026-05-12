@@ -25,10 +25,13 @@ const PARTNER_FIELDS = {
 };
 
 // Shared state — persists in memory on the server, same for all users
+// NOTE: snapshot key holds Operating Snapshot tile values (netDelta, partners,
+// collection, incidents, plans72) so all admins see the same values.
 let sharedState = {
   census: 4,
   kpi: {},
-  fin: {}
+  fin: {},
+  snapshot: {}
 };
 
 function classifyOpsTask(name) {
@@ -208,6 +211,7 @@ const server = http.createServer(async (req, res) => {
       if (body.census !== undefined) sharedState.census = body.census;
       if (body.kpi) sharedState.kpi = { ...sharedState.kpi, ...body.kpi };
       if (body.fin) sharedState.fin = { ...sharedState.fin, ...body.fin };
+      if (body.snapshot) sharedState.snapshot = { ...sharedState.snapshot, ...body.snapshot };
       console.log('Shared state updated:', JSON.stringify(sharedState));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, state: sharedState }));
