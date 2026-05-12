@@ -3,6 +3,12 @@ const http = require('http');
 
 const API_TOKEN = process.env.CLICKUP_API_TOKEN;
 const PORT = process.env.PORT || 3000;
+// DASHBOARD_TOKEN: shared secret between frontend (index.html) and backend.
+// When set, all routes except OPTIONS (CORS preflight) and /health require an
+// X-Dashboard-Token header matching this value. Blocks random API scrapers.
+// When NOT set (legacy / first-deploy state), auth is skipped — server logs a
+// warning at startup. Set this in Railway env vars to activate enforcement.
+const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || '';
 
 const LIST_IDS = [
   '901712935558','901712935562','901712935566',
@@ -351,6 +357,17 @@ const server = http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
   const query = req.url.includes('?') ? req.url.split('?')[1] : '';
   const force = query.includes('refresh=true');
+
+  // Auth check — only enforced when DASHBOARD_TOKEN env var is set.
+  // /health stays public (monitoring); everything else requires the header.
+  if (DASHBOARD_TOKEN && url !== '/health') {
+    const provided = req.headers['x-dashboard-token'];
+    if (provided !== DASHBOARD_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: 'unauthorized — missing or invalid X-Dashboard-Token header' }));
+      return;
+    }
+  }
 
   // GET tasks
   if (req.method === 'GET' && url === '/tasks') {
@@ -761,4 +778,6 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`Bright Horizons API running on port ${PORT}`);
   if (!API_TOKEN) console.warn('WARNING: CLICKUP_API_TOKEN not set');
+  if (!DASHBOARD_TOKEN) console.warn('WARNING: DASHBOARD_TOKEN not set — auth enforcement DISABLED');
+  else console.log('Auth enabled — DASHBOARD_TOKEN required on all routes except /health');
 });
