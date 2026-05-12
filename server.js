@@ -38,11 +38,15 @@ const REFERRAL_FIELDS = {
 // Shared state — persists in memory on the server, same for all users
 // NOTE: snapshot key holds Operating Snapshot tile values (netDelta, partners,
 // collection, incidents, plans72) so all admins see the same values.
+// clinical_kpis is an array of Dr. Jennifer's weekly submissions, upserted by
+// week_of (re-submitting the same week replaces, doesn't duplicate). Capped
+// at 52 entries (one year) to prevent unbounded growth.
 let sharedState = {
   census: 4,
   kpi: {},
   fin: {},
-  snapshot: {}
+  snapshot: {},
+  clinical_kpis: []
 };
 
 function classifyOpsTask(name) {
@@ -268,6 +272,19 @@ const server = http.createServer(async (req, res) => {
       if (body.kpi) sharedState.kpi = { ...sharedState.kpi, ...body.kpi };
       if (body.fin) sharedState.fin = { ...sharedState.fin, ...body.fin };
       if (body.snapshot) sharedState.snapshot = { ...sharedState.snapshot, ...body.snapshot };
+      // Clinical KPI weekly submission — upsert by week_of, cap at 52 entries
+      if (body.clinical_kpi_entry && body.clinical_kpi_entry.week_of) {
+        sharedState.clinical_kpis = Array.isArray(sharedState.clinical_kpis) ? sharedState.clinical_kpis : [];
+        const wk = body.clinical_kpi_entry.week_of;
+        const idx = sharedState.clinical_kpis.findIndex(e => e && e.week_of === wk);
+        if (idx >= 0) sharedState.clinical_kpis[idx] = body.clinical_kpi_entry;
+        else sharedState.clinical_kpis.push(body.clinical_kpi_entry);
+        // Sort ascending by week_of so consumers (sparklines) can read left→right.
+        sharedState.clinical_kpis.sort((a, b) => (a.week_of || '').localeCompare(b.week_of || ''));
+        if (sharedState.clinical_kpis.length > 52) {
+          sharedState.clinical_kpis = sharedState.clinical_kpis.slice(-52);
+        }
+      }
       console.log('Shared state updated:', JSON.stringify(sharedState));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, state: sharedState }));
