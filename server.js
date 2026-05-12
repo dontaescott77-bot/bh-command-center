@@ -60,6 +60,8 @@ const MAX_PDF_BYTES = 10 * 1024 * 1024; // 10 MB cap on uploaded PDFs
 // (avg_census, admits, discharges).
 // billing_kpis follows the same pattern for Sheila's monthly submissions
 // (upserted by month_of "YYYY-MM" instead of week_of).
+// marketing_kpis follows the weekly upsert pattern for Jamie's submissions
+// (social_posts, inquiries, marketing_hours, ad_spend).
 let sharedState = {
   census: 4,
   kpi: {},
@@ -67,7 +69,8 @@ let sharedState = {
   snapshot: {},
   clinical_kpis: [],
   operations_kpis: [],
-  billing_kpis: []
+  billing_kpis: [],
+  marketing_kpis: []
 };
 
 function classifyOpsTask(name) {
@@ -413,6 +416,18 @@ const server = http.createServer(async (req, res) => {
         sharedState.billing_kpis.sort((a, b) => (a.month_of || '').localeCompare(b.month_of || ''));
         if (sharedState.billing_kpis.length > 36) {
           sharedState.billing_kpis = sharedState.billing_kpis.slice(-36);
+        }
+      }
+      // Marketing KPI weekly submission (Jamie) — upsert by week_of, cap at 52
+      if (body.marketing_kpi_entry && body.marketing_kpi_entry.week_of) {
+        sharedState.marketing_kpis = Array.isArray(sharedState.marketing_kpis) ? sharedState.marketing_kpis : [];
+        const wk = body.marketing_kpi_entry.week_of;
+        const idx = sharedState.marketing_kpis.findIndex(e => e && e.week_of === wk);
+        if (idx >= 0) sharedState.marketing_kpis[idx] = body.marketing_kpi_entry;
+        else sharedState.marketing_kpis.push(body.marketing_kpi_entry);
+        sharedState.marketing_kpis.sort((a, b) => (a.week_of || '').localeCompare(b.week_of || ''));
+        if (sharedState.marketing_kpis.length > 52) {
+          sharedState.marketing_kpis = sharedState.marketing_kpis.slice(-52);
         }
       }
       console.log('Shared state updated:', JSON.stringify(sharedState));
