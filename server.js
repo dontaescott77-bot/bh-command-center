@@ -35,6 +35,15 @@ const REFERRAL_FIELDS = {
   notes_outcome:  'f81a81c4-e7f6-41ca-869e-6fc62105dafc',
 };
 
+// AR Aging (Sheila's outstanding patient balances)
+const AR_LIST_ID = '901713702311';
+const AR_FIELDS = {
+  amount:             '85115b0f-3bac-49fa-8c6a-65e40523e8de',
+  date_of_service:    '745b467c-cd28-4429-ae42-3c1845728ade',
+  reason_status_note: '16e09408-9d12-4f24-b786-e59287092718',
+  payer:              '5ab08285-1454-485b-a994-e911bad0fa2f',
+};
+
 // Shared state — persists in memory on the server, same for all users
 // NOTE: snapshot key holds Operating Snapshot tile values (netDelta, partners,
 // collection, incidents, plans72) so all admins see the same values.
@@ -43,13 +52,16 @@ const REFERRAL_FIELDS = {
 // at 52 entries (one year) to prevent unbounded growth.
 // operations_kpis follows the same pattern for Dylan's weekly snapshots
 // (avg_census, admits, discharges).
+// billing_kpis follows the same pattern for Sheila's monthly submissions
+// (upserted by month_of "YYYY-MM" instead of week_of).
 let sharedState = {
   census: 4,
   kpi: {},
   fin: {},
   snapshot: {},
   clinical_kpis: [],
-  operations_kpis: []
+  operations_kpis: [],
+  billing_kpis: []
 };
 
 function classifyOpsTask(name) {
@@ -215,6 +227,43 @@ async function getCachedReferrals(force) {
   return referralCache;
 }
 
+// AR Aging cache (mirrors referrals pattern)
+let arCache = null;
+let arCacheTime = 0;
+const AR_TTL = 30 * 1000;
+
+async function getARTasks() {
+  const data = await clickupRequest('GET', `/list/${AR_LIST_ID}/task?include_closed=true&subtasks=false`);
+  return (data.tasks || []).map(t => {
+    const cf = { amount: null, date_of_service: null, reason_status_note: '', payer: '' };
+    (t.custom_fields || []).forEach(f => {
+      if (f.id === AR_FIELDS.amount) cf.amount = (f.value !== undefined && f.value !== null) ? parseFloat(f.value) : null;
+      else if (f.id === AR_FIELDS.date_of_service) cf.date_of_service = f.value ? parseInt(f.value) : null;
+      else if (f.id === AR_FIELDS.reason_status_note) cf.reason_status_note = f.value || '';
+      else if (f.id === AR_FIELDS.payer) cf.payer = f.value || '';
+    });
+    return {
+      id: t.id,
+      name: t.name,
+      status: t.status?.status || 'Open',
+      url: t.url,
+      date_created: t.date_created,
+      date_updated: t.date_updated,
+      description: t.description || '',
+      ...cf
+    };
+  });
+}
+
+async function getCachedAR(force) {
+  const now = Date.now();
+  if (!force && arCache && (now - arCacheTime) < AR_TTL) return arCache;
+  console.log('Fetching AR Aging from ClickUp...');
+  arCache = await getARTasks();
+  arCacheTime = now;
+  return arCache;
+}
+
 function parseBody(req) {
   return new Promise((resolve) => {
     let body = '';
@@ -298,6 +347,18 @@ const server = http.createServer(async (req, res) => {
         sharedState.operations_kpis.sort((a, b) => (a.week_of || '').localeCompare(b.week_of || ''));
         if (sharedState.operations_kpis.length > 52) {
           sharedState.operations_kpis = sharedState.operations_kpis.slice(-52);
+        }
+      }
+      // Billing KPI monthly submission (Sheila) — upsert by month_of (YYYY-MM), cap at 36 (3 years)
+      if (body.billing_kpi_entry && body.billing_kpi_entry.month_of) {
+        sharedState.billing_kpis = Array.isArray(sharedState.billing_kpis) ? sharedState.billing_kpis : [];
+        const mo = body.billing_kpi_entry.month_of;
+        const idx = sharedState.billing_kpis.findIndex(e => e && e.month_of === mo);
+        if (idx >= 0) sharedState.billing_kpis[idx] = body.billing_kpi_entry;
+        else sharedState.billing_kpis.push(body.billing_kpi_entry);
+        sharedState.billing_kpis.sort((a, b) => (a.month_of || '').localeCompare(b.month_of || ''));
+        if (sharedState.billing_kpis.length > 36) {
+          sharedState.billing_kpis = sharedState.billing_kpis.slice(-36);
         }
       }
       console.log('Shared state updated:', JSON.stringify(sharedState));
@@ -484,6 +545,71 @@ const server = http.createServer(async (req, res) => {
       }));
     } catch(e) {
       console.error('Referral create error:', e.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: e.message }));
+    }
+    return;
+  }
+
+  // GET ar — fetch all AR Aging tasks with custom fields parsed
+  if (req.method === 'GET' && url === '/ar') {
+    try {
+      const tasks = await getCachedAR(force);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, tasks, cached_at: new Date(arCacheTime).toISOString() }));
+    } catch(e) {
+      console.error('AR fetch error:', e.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: e.message }));
+    }
+    return;
+  }
+
+  // POST ar — create a new AR line item. `initials` becomes the task name.
+  if (req.method === 'POST' && url === '/ar') {
+    try {
+      const body = await parseBody(req);
+      const { initials, status, amount, date_of_service, reason_status_note, payer } = body;
+
+      if (!initials || !initials.trim()) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'initials is required' }));
+        return;
+      }
+
+      const custom_fields = [];
+      if (amount !== undefined && amount !== null && amount !== '') custom_fields.push({ id: AR_FIELDS.amount, value: parseFloat(amount) });
+      if (date_of_service) custom_fields.push({ id: AR_FIELDS.date_of_service, value: parseInt(date_of_service) });
+      if (reason_status_note) custom_fields.push({ id: AR_FIELDS.reason_status_note, value: reason_status_note });
+      if (payer) custom_fields.push({ id: AR_FIELDS.payer, value: payer });
+
+      const payload = {
+        name: initials.trim(),
+        description: reason_status_note || '',
+        ...(status ? { status } : {}),
+        ...(custom_fields.length > 0 ? { custom_fields } : {})
+      };
+
+      const result = await clickupRequest('POST', `/list/${AR_LIST_ID}/task`, payload);
+
+      if (result.err || result.errors) {
+        console.error('ClickUp rejected AR create:', JSON.stringify(result));
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: result.err || JSON.stringify(result.errors) }));
+        return;
+      }
+
+      arCache = null;
+      arCacheTime = 0;
+
+      console.log(`AR item created: ${result.id} — ${result.name}`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        task: { id: result.id, name: result.name, url: result.url, status: result.status?.status }
+      }));
+    } catch(e) {
+      console.error('AR create error:', e.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: false, error: e.message }));
     }
