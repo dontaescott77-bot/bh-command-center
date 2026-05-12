@@ -44,6 +44,12 @@ const AR_FIELDS = {
   payer:              '5ab08285-1454-485b-a994-e911bad0fa2f',
 };
 
+// Billing Reports — archive of Sheila's monthly billing PDFs.
+// Each task is named "YYYY-MM" with the PDF attached. Created on first upload
+// for that month; subsequent uploads for the same month replace the attachment.
+const BILLING_REPORTS_LIST_ID = '901713712222';
+const MAX_PDF_BYTES = 10 * 1024 * 1024; // 10 MB cap on uploaded PDFs
+
 // Shared state — persists in memory on the server, same for all users
 // NOTE: snapshot key holds Operating Snapshot tile values (netDelta, partners,
 // collection, incidents, plans72) so all admins see the same values.
@@ -266,12 +272,60 @@ async function getCachedAR(force) {
 
 function parseBody(req) {
   return new Promise((resolve) => {
-    let body = '';
-    req.on('data', chunk => body += chunk);
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
     req.on('end', () => {
-      try { resolve(JSON.parse(body)); }
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
       catch(e) { resolve({}); }
     });
+  });
+}
+
+// ───── Billing report PDF helpers ─────
+// Find a task in BILLING_REPORTS_LIST_ID named monthOf (e.g. "2026-04"); create it if missing.
+async function findOrCreateBillingReportTask(monthOf) {
+  const data = await clickupRequest('GET', `/list/${BILLING_REPORTS_LIST_ID}/task?include_closed=true&subtasks=false`);
+  const existing = (data.tasks || []).find(t => t.name === monthOf);
+  if (existing) return existing;
+  const created = await clickupRequest('POST', `/list/${BILLING_REPORTS_LIST_ID}/task`, { name: monthOf });
+  return created;
+}
+
+// Upload a binary file as a ClickUp task attachment using vanilla Node.js
+// multipart/form-data — no external deps. Returns the parsed JSON response.
+function clickupAttachmentUpload(taskId, filename, contentType, fileBuffer) {
+  return new Promise((resolve, reject) => {
+    const boundary = '----BHBoundary' + Date.now() + Math.random().toString(36).slice(2);
+    const safeName = String(filename || 'attachment.pdf').replace(/"/g, '');
+    const head = Buffer.from(
+      `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="attachment"; filename="${safeName}"\r\n` +
+      `Content-Type: ${contentType || 'application/octet-stream'}\r\n\r\n`
+    );
+    const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const body = Buffer.concat([head, fileBuffer, tail]);
+    const options = {
+      hostname: 'api.clickup.com',
+      path: `/api/v2/task/${taskId}/attachment`,
+      method: 'POST',
+      headers: {
+        'Authorization': API_TOKEN,
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': body.length
+      }
+    };
+    const req = https.request(options, (res) => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        try { resolve(JSON.parse(text)); }
+        catch(e) { reject(new Error('Attachment response not JSON: ' + text.slice(0, 200))); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
   });
 }
 
@@ -610,6 +664,68 @@ const server = http.createServer(async (req, res) => {
       }));
     } catch(e) {
       console.error('AR create error:', e.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: e.message }));
+    }
+    return;
+  }
+
+  // POST billing-report-upload — accept a base64-encoded PDF, attach it to the
+  // monthly task in BILLING_REPORTS_LIST_ID. Creates the task if it doesn't
+  // exist yet. Body: { month_of: "YYYY-MM", filename: "x.pdf", base64: "..." }
+  if (req.method === 'POST' && url === '/billing-report-upload') {
+    try {
+      const body = await parseBody(req);
+      const { month_of, filename, base64 } = body;
+      if (!month_of || !/^\d{4}-\d{2}$/.test(month_of)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'month_of (YYYY-MM) is required' }));
+        return;
+      }
+      if (!filename || !base64) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'filename and base64 are required' }));
+        return;
+      }
+      let fileBuffer;
+      try { fileBuffer = Buffer.from(base64, 'base64'); }
+      catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'base64 decode failed' }));
+        return;
+      }
+      if (fileBuffer.length === 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'empty file' }));
+        return;
+      }
+      if (fileBuffer.length > MAX_PDF_BYTES) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: `file too large (${fileBuffer.length} bytes, max ${MAX_PDF_BYTES})` }));
+        return;
+      }
+      const task = await findOrCreateBillingReportTask(month_of);
+      if (!task || !task.id) {
+        throw new Error('Could not find or create billing report task');
+      }
+      const att = await clickupAttachmentUpload(task.id, filename, 'application/pdf', fileBuffer);
+      if (att && (att.err || att.errors)) {
+        console.error('ClickUp rejected attachment:', JSON.stringify(att));
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: att.err || JSON.stringify(att.errors) }));
+        return;
+      }
+      console.log(`Billing PDF attached: ${filename} -> task ${task.id} (${month_of})`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        task_id: task.id,
+        task_url: task.url,
+        attachment_url: (att && att.url) || null,
+        attachment_id: (att && att.id) || null
+      }));
+    } catch(e) {
+      console.error('Billing PDF upload error:', e.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: false, error: e.message }));
     }
