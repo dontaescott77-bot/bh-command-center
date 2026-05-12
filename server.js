@@ -41,12 +41,15 @@ const REFERRAL_FIELDS = {
 // clinical_kpis is an array of Dr. Jennifer's weekly submissions, upserted by
 // week_of (re-submitting the same week replaces, doesn't duplicate). Capped
 // at 52 entries (one year) to prevent unbounded growth.
+// operations_kpis follows the same pattern for Dylan's weekly snapshots
+// (avg_census, admits, discharges).
 let sharedState = {
   census: 4,
   kpi: {},
   fin: {},
   snapshot: {},
-  clinical_kpis: []
+  clinical_kpis: [],
+  operations_kpis: []
 };
 
 function classifyOpsTask(name) {
@@ -283,6 +286,18 @@ const server = http.createServer(async (req, res) => {
         sharedState.clinical_kpis.sort((a, b) => (a.week_of || '').localeCompare(b.week_of || ''));
         if (sharedState.clinical_kpis.length > 52) {
           sharedState.clinical_kpis = sharedState.clinical_kpis.slice(-52);
+        }
+      }
+      // Operations KPI weekly submission (Dylan) — same upsert pattern
+      if (body.operations_kpi_entry && body.operations_kpi_entry.week_of) {
+        sharedState.operations_kpis = Array.isArray(sharedState.operations_kpis) ? sharedState.operations_kpis : [];
+        const wk = body.operations_kpi_entry.week_of;
+        const idx = sharedState.operations_kpis.findIndex(e => e && e.week_of === wk);
+        if (idx >= 0) sharedState.operations_kpis[idx] = body.operations_kpi_entry;
+        else sharedState.operations_kpis.push(body.operations_kpi_entry);
+        sharedState.operations_kpis.sort((a, b) => (a.week_of || '').localeCompare(b.week_of || ''));
+        if (sharedState.operations_kpis.length > 52) {
+          sharedState.operations_kpis = sharedState.operations_kpis.slice(-52);
         }
       }
       console.log('Shared state updated:', JSON.stringify(sharedState));
