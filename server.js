@@ -24,6 +24,17 @@ const PARTNER_FIELDS = {
   next_action:  '6f43c5f3-b426-47bb-bae0-84a43707a5e8',
 };
 
+// Referrals (Matt's actual referral records — separate from operational task list)
+const REFERRAL_LIST_ID = '901713684670';
+const REFERRAL_FIELDS = {
+  source_name:    '1206ad7b-4f9a-4542-8aab-86e2ffb70aaa',
+  source_type:    '1e4dd6fb-acf9-44fb-8f69-e8b678c9aa88',
+  source_contact: '871fd9eb-e3e4-4f47-95c1-402f42ab8f5d',
+  date_received:  'f8e8002a-ef72-4bd8-81c4-79dc0e83b1b0',
+  asam_level:     'e7b796cb-f518-40b7-8b3b-615b65e0f24d',
+  notes_outcome:  'f81a81c4-e7f6-41ca-869e-6fc62105dafc',
+};
+
 // Shared state — persists in memory on the server, same for all users
 // NOTE: snapshot key holds Operating Snapshot tile values (netDelta, partners,
 // collection, incidents, plans72) so all admins see the same values.
@@ -150,6 +161,51 @@ async function getCachedOutreach(force) {
   outreachCache = await getOutreachTasks();
   outreachCacheTime = now;
   return outreachCache;
+}
+
+// Referrals cache (mirrors outreach pattern)
+let referralCache = null;
+let referralCacheTime = 0;
+const REFERRAL_TTL = 30 * 1000;
+
+async function getReferralTasks() {
+  const data = await clickupRequest('GET', `/list/${REFERRAL_LIST_ID}/task?include_closed=true&subtasks=false`);
+  return (data.tasks || []).map(t => {
+    const cf = { source_name: '', source_type: '', source_type_id: null, source_contact: '', date_received: null, asam_level: '', notes_outcome: '' };
+    (t.custom_fields || []).forEach(f => {
+      if (f.id === REFERRAL_FIELDS.source_name) cf.source_name = f.value || '';
+      else if (f.id === REFERRAL_FIELDS.source_contact) cf.source_contact = f.value || '';
+      else if (f.id === REFERRAL_FIELDS.source_type) {
+        cf.source_type_id = f.value || null;
+        if (f.value !== undefined && f.value !== null && f.type_config && Array.isArray(f.type_config.options)) {
+          const opt = f.type_config.options.find(o => o.id === f.value || o.orderindex === f.value);
+          cf.source_type = opt ? opt.name : '';
+        }
+      }
+      else if (f.id === REFERRAL_FIELDS.date_received) cf.date_received = f.value ? parseInt(f.value) : null;
+      else if (f.id === REFERRAL_FIELDS.asam_level) cf.asam_level = f.value || '';
+      else if (f.id === REFERRAL_FIELDS.notes_outcome) cf.notes_outcome = f.value || '';
+    });
+    return {
+      id: t.id,
+      name: t.name,
+      status: t.status?.status || 'New',
+      url: t.url,
+      date_created: t.date_created,
+      date_updated: t.date_updated,
+      description: t.description || '',
+      ...cf
+    };
+  });
+}
+
+async function getCachedReferrals(force) {
+  const now = Date.now();
+  if (!force && referralCache && (now - referralCacheTime) < REFERRAL_TTL) return referralCache;
+  console.log('Fetching referrals from ClickUp...');
+  referralCache = await getReferralTasks();
+  referralCacheTime = now;
+  return referralCache;
 }
 
 function parseBody(req) {
@@ -328,6 +384,74 @@ const server = http.createServer(async (req, res) => {
       }));
     } catch(e) {
       console.error('Outreach create error:', e.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: e.message }));
+    }
+    return;
+  }
+
+  // GET referrals — fetch all tasks from BH Referrals (with custom fields parsed)
+  if (req.method === 'GET' && url === '/referrals') {
+    try {
+      const tasks = await getCachedReferrals(force);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, tasks, cached_at: new Date(referralCacheTime).toISOString() }));
+    } catch(e) {
+      console.error('Referrals fetch error:', e.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: e.message }));
+    }
+    return;
+  }
+
+  // POST referrals — create new referral record in the BH Referrals list.
+  // `initials` becomes the task name (patient initials only for privacy).
+  if (req.method === 'POST' && url === '/referrals') {
+    try {
+      const body = await parseBody(req);
+      const { initials, status, source_name, source_type, source_contact, date_received, asam_level, notes_outcome } = body;
+
+      if (!initials || !initials.trim()) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'initials is required' }));
+        return;
+      }
+
+      const custom_fields = [];
+      if (source_name)    custom_fields.push({ id: REFERRAL_FIELDS.source_name,    value: source_name });
+      if (source_type)    custom_fields.push({ id: REFERRAL_FIELDS.source_type,    value: source_type });
+      if (source_contact) custom_fields.push({ id: REFERRAL_FIELDS.source_contact, value: source_contact });
+      if (date_received)  custom_fields.push({ id: REFERRAL_FIELDS.date_received,  value: parseInt(date_received) });
+      if (asam_level)     custom_fields.push({ id: REFERRAL_FIELDS.asam_level,     value: asam_level });
+      if (notes_outcome)  custom_fields.push({ id: REFERRAL_FIELDS.notes_outcome,  value: notes_outcome });
+
+      const payload = {
+        name: initials.trim(),
+        description: notes_outcome || '',
+        ...(status ? { status } : {}),
+        ...(custom_fields.length > 0 ? { custom_fields } : {})
+      };
+
+      const result = await clickupRequest('POST', `/list/${REFERRAL_LIST_ID}/task`, payload);
+
+      if (result.err || result.errors) {
+        console.error('ClickUp rejected referral create:', JSON.stringify(result));
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: result.err || JSON.stringify(result.errors) }));
+        return;
+      }
+
+      referralCache = null;
+      referralCacheTime = 0;
+
+      console.log(`Referral created: ${result.id} — ${result.name}`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        task: { id: result.id, name: result.name, url: result.url, status: result.status?.status }
+      }));
+    } catch(e) {
+      console.error('Referral create error:', e.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: false, error: e.message }));
     }
