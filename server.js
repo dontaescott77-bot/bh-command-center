@@ -122,29 +122,46 @@ function clickupRequest(method, path, body) {
 }
 
 // ───── Persistent state helpers (Approach B) ─────
-// hydrateState: called once on server boot. Reads STATE_TASK_ID's description,
-// parses it as JSON, and merges into sharedState. Handles empty / malformed
-// gracefully — server still boots with defaults if the read fails.
+// hydrateState: read the most recent comment on STATE_TASK_ID. Each persist
+// posts a new comment containing the JSON blob; hydrate restores from the
+// latest. We use comments instead of the task description because ClickUp's
+// PUT /task silently drops description writes for this account. Comments work.
 async function hydrateState() {
   if (!STATE_TASK_ID) return;
   try {
-    const task = await clickupRequest('GET', `/task/${STATE_TASK_ID}`);
-    if (!task || !task.description) {
-      console.log('State hydrate: task has no description, starting from defaults');
+    const data = await clickupRequest('GET', `/task/${STATE_TASK_ID}/comment`);
+    const comments = (data && data.comments) || [];
+    if (!comments.length) {
+      console.log('State hydrate: no comments yet, starting from defaults');
       return;
     }
-    const parsed = JSON.parse(task.description);
-    if (parsed && typeof parsed === 'object') {
-      Object.assign(sharedState, parsed);
-      const counts = {
-        snapshot: Object.keys(sharedState.snapshot || {}).length,
-        clinical: (sharedState.clinical_kpis || []).length,
-        operations: (sharedState.operations_kpis || []).length,
-        billing: (sharedState.billing_kpis || []).length,
-        marketing: (sharedState.marketing_kpis || []).length
-      };
-      console.log('State hydrated from ClickUp:', JSON.stringify(counts));
+    // Comments are typically returned in reverse-chronological order; sort to be safe.
+    comments.sort((a, b) => parseInt(b.date || 0) - parseInt(a.date || 0));
+    // Find the most recent comment that contains valid JSON (skip any manual
+    // human-entered comments that aren't state blobs).
+    for (const c of comments) {
+      const text = (c.comment_text || '').trim();
+      if (!text || text === '{}') continue;
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === 'object') {
+          Object.assign(sharedState, parsed);
+          const counts = {
+            snapshot: Object.keys(sharedState.snapshot || {}).length,
+            clinical: (sharedState.clinical_kpis || []).length,
+            operations: (sharedState.operations_kpis || []).length,
+            billing: (sharedState.billing_kpis || []).length,
+            marketing: (sharedState.marketing_kpis || []).length
+          };
+          console.log('State hydrated from ClickUp comment ' + c.id + ':', JSON.stringify(counts));
+          return;
+        }
+      } catch(parseErr) {
+        // Not JSON — try the next-most-recent comment.
+        continue;
+      }
     }
+    console.log('State hydrate: no valid JSON comment found, starting from defaults');
   } catch(e) {
     console.error('State hydrate failed:', e.message, '— continuing with defaults');
   }
@@ -163,8 +180,21 @@ async function persistState() {
   if (_persistInFlight) { _persistPending = true; return; }
   _persistInFlight = true;
   try {
-    const body = JSON.stringify(sharedState);
-    await clickupRequest('PUT', `/task/${STATE_TASK_ID}`, { description: body });
+    const json = JSON.stringify(sharedState);
+    // Persist by appending a comment to STATE_TASK_ID. Each comment is the
+    // raw JSON blob. hydrateState reads the most recent one. Old comments
+    // accumulate harmlessly (could be cleaned up periodically — phase 4 nice-to-have).
+    const result = await clickupRequest('POST', `/task/${STATE_TASK_ID}/comment`, {
+      comment_text: json,
+      notify_all: false
+    });
+    if (result && (result.err || result.errors)) {
+      console.error('State persist rejected by ClickUp:', JSON.stringify(result).slice(0, 200));
+    } else if (result && result.id) {
+      console.log('State persisted as comment ' + result.id + ' (' + json.length + ' bytes)');
+    } else {
+      console.log('State persist: response missing comment id');
+    }
   } catch(e) {
     console.error('State persist failed:', e.message);
   } finally {
