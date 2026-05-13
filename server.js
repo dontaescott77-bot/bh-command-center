@@ -10,6 +10,11 @@ const PORT = process.env.PORT || 3000;
 // warning at startup. Set this in Railway env vars to activate enforcement.
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || '';
 
+// ANTHROPIC_API_KEY: used by /billing-extract to read Sheila's monthly billing
+// PDF and pre-fill the 5 numeric fields. If not set, /billing-extract returns
+// a structured error and the frontend silently falls back to manual entry.
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+
 const LIST_IDS = [
   '901712935558','901712935562','901712935566',
   '901712935573','901712935575','901712935581','901708395565',
@@ -468,6 +473,117 @@ function clickupAttachmentUpload(taskId, filename, contentType, fileBuffer) {
     req.write(body);
     req.end();
   });
+}
+
+// ───── Anthropic API helper for billing PDF extraction (Phase 4.5) ─────
+// Calls api.anthropic.com Messages endpoint with the PDF as a document content
+// block. Returns the parsed JSON response body. Throws on network or HTTP error.
+function anthropicRequest(body) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body);
+    const options = {
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(data)
+      }
+    };
+    const req = https.request(options, (res) => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        try {
+          const parsed = JSON.parse(text);
+          if (res.statusCode >= 400) {
+            return reject(new Error(`Anthropic ${res.statusCode}: ${parsed.error?.message || text.slice(0, 200)}`));
+          }
+          resolve(parsed);
+        } catch (e) {
+          reject(new Error(`Anthropic response not JSON: ${text.slice(0, 200)}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+// extractBillingFields: pass Sheila's monthly billing PDF to Claude Haiku and
+// pull out the 5 numeric fields. Returns:
+//   { total_billed, total_collected, denial_rate, claims_count, total_ar }
+// All values are numbers (or null if the model couldn't find them).
+// Throws if API call fails or response doesn't parse — caller handles fallback.
+async function extractBillingFields(pdfBase64) {
+  const prompt = [
+    'You are extracting five numeric fields from a monthly billing report PDF.',
+    'Return ONLY a JSON object (no prose, no markdown, no code fences) with exactly these keys:',
+    '',
+    '{',
+    '  "total_billed": <number, dollars without $ or commas>,',
+    '  "total_collected": <number, dollars without $ or commas>,',
+    '  "denial_rate": <number, percentage as 0-100 e.g. 0 for "0%", 5.2 for "5.2%">,',
+    '  "claims_count": <integer, total count of claims submitted in the period>,',
+    '  "total_ar": <number, total accounts receivable in dollars without $ or commas>',
+    '}',
+    '',
+    'Field mapping inside the PDF:',
+    '- "Total Billed" in the Financial Summary  ->  total_billed',
+    '- "Total Collected" in the Financial Summary  ->  total_collected',
+    '- "Denial Rate" in the Denial Rate section (drop the % sign)  ->  denial_rate',
+    '- "Claims Submitted" in the Denial Rate section  ->  claims_count',
+    '- The row labeled exactly "Total AR" in the AR Aging section  ->  total_ar',
+    '',
+    'If a value cannot be found, set it to null. Return only the JSON object.'
+  ].join('\n');
+
+  const resp = await anthropicRequest({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 300,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'document',
+            source: {
+              type: 'base64',
+              media_type: 'application/pdf',
+              data: pdfBase64
+            }
+          },
+          { type: 'text', text: prompt }
+        ]
+      }
+    ]
+  });
+
+  // Pull the text block from the response.
+  const textBlock = (resp.content || []).find(b => b.type === 'text');
+  const raw = (textBlock && textBlock.text) ? textBlock.text.trim() : '';
+  if (!raw) throw new Error('Anthropic returned no text content');
+
+  // Strip possible code fences just in case the model adds them despite the prompt.
+  const stripped = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+
+  let parsed;
+  try { parsed = JSON.parse(stripped); }
+  catch (e) { throw new Error('Model output was not valid JSON: ' + stripped.slice(0, 200)); }
+
+  // Normalize: coerce each field to a number (or null) and validate ranges.
+  const out = {
+    total_billed:    safeFloat(parsed.total_billed,    0, 10000000),
+    total_collected: safeFloat(parsed.total_collected, 0, 10000000),
+    denial_rate:     safeFloat(parsed.denial_rate,     0, 100),
+    claims_count:    safeInt(parsed.claims_count,      0, 100000),
+    total_ar:        safeFloat(parsed.total_ar,        0, 10000000)
+  };
+  return out;
 }
 
 function setCORS(res) {
@@ -976,10 +1092,65 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // POST billing-extract — read a billing PDF via Claude and return the 5 KPI
+  // numbers (total_billed, total_collected, denial_rate, claims_count, total_ar).
+  // Body: { filename: "x.pdf", base64: "..." }. No write side effects; this is a
+  // pure read helper invoked before Sheila submits her monthly form. The frontend
+  // is expected to fall back to manual entry on any error (silent fallback).
+  if (req.method === 'POST' && url === '/billing-extract') {
+    try {
+      if (!ANTHROPIC_API_KEY) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'ANTHROPIC_API_KEY not configured on server' }));
+        return;
+      }
+      const body = await parseBody(req);
+      const base64 = body.base64;
+      if (!base64 || typeof base64 !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'base64 is required (string)' }));
+        return;
+      }
+      // Validate size (same 10 MB cap as upload endpoint).
+      let fileBuffer;
+      try { fileBuffer = Buffer.from(base64, 'base64'); }
+      catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'base64 decode failed' }));
+        return;
+      }
+      if (fileBuffer.length === 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'empty file' }));
+        return;
+      }
+      if (fileBuffer.length > MAX_PDF_BYTES) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: `file too large (${fileBuffer.length} bytes, max ${MAX_PDF_BYTES})` }));
+        return;
+      }
+
+      const extracted = await extractBillingFields(base64);
+      console.log('Billing extract result:', JSON.stringify(extracted));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, extracted }));
+    } catch(e) {
+      console.error('Billing extract error:', e.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: e.message }));
+    }
+    return;
+  }
+
   // GET health
   if (req.method === 'GET' && url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', service: 'Bright Horizons Command Center API', token_set: !!API_TOKEN }));
+    res.end(JSON.stringify({
+      status: 'ok',
+      service: 'Bright Horizons Command Center API',
+      token_set: !!API_TOKEN,
+      anthropic_set: !!ANTHROPIC_API_KEY
+    }));
     return;
   }
 
@@ -992,6 +1163,8 @@ server.listen(PORT, () => {
   if (!API_TOKEN) console.warn('WARNING: CLICKUP_API_TOKEN not set');
   if (!DASHBOARD_TOKEN) console.warn('WARNING: DASHBOARD_TOKEN not set — auth enforcement DISABLED');
   else console.log('Auth enabled — DASHBOARD_TOKEN required on all routes except /health');
+  if (!ANTHROPIC_API_KEY) console.warn('WARNING: ANTHROPIC_API_KEY not set — /billing-extract will return 503');
+  else console.log('Anthropic API key detected — /billing-extract enabled');
   // Hydrate sharedState from the persistent ClickUp task. Does NOT block the
   // listen() — first few GET /state calls during boot may return defaults
   // briefly until hydration completes (~500ms). Acceptable for a small tool.
