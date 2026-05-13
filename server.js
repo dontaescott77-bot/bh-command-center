@@ -381,6 +381,47 @@ function parseBody(req) {
   });
 }
 
+// ───── Input validation helpers (Phase 4.1) ─────
+// safeText: coerce to string, strip HTML tags, trim, truncate to maxLen.
+// Always returns a string (possibly empty). Use for free-text user fields.
+function safeText(value, maxLen) {
+  if (value == null) return '';
+  let s = String(value).replace(/<[^>]*>/g, '').trim();
+  if (maxLen && s.length > maxLen) s = s.slice(0, maxLen);
+  return s;
+}
+// safeInt: parse integer with optional bounds. Returns null if invalid/out-of-range.
+function safeInt(value, min, max) {
+  const n = parseInt(value, 10);
+  if (!Number.isFinite(n)) return null;
+  if (min !== undefined && n < min) return null;
+  if (max !== undefined && n > max) return null;
+  return n;
+}
+// safeFloat: parse float with optional bounds. Returns null if invalid/out-of-range.
+function safeFloat(value, min, max) {
+  const n = parseFloat(value);
+  if (!Number.isFinite(n)) return null;
+  if (min !== undefined && n < min) return null;
+  if (max !== undefined && n > max) return null;
+  return n;
+}
+// safeWeekOf: enforce YYYY-MM-DD format. Returns the string if valid, else null.
+function safeWeekOf(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  return value;
+}
+// safeMonthOf: enforce YYYY-MM format. Returns the string if valid, else null.
+function safeMonthOf(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}$/.test(value)) return null;
+  return value;
+}
+// safeEnum: return value if it's in the allowed list, else null.
+function safeEnum(value, allowed) {
+  if (typeof value !== 'string') return null;
+  return allowed.includes(value) ? value : null;
+}
+
 // ───── Billing report PDF helpers ─────
 // Find a task in BILLING_REPORTS_LIST_ID named monthOf (e.g. "2026-04"); create it if missing.
 async function findOrCreateBillingReportTask(monthOf) {
@@ -484,58 +525,111 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url === '/state') {
     try {
       const body = await parseBody(req);
-      // Merge incoming state with existing state
-      if (body.census !== undefined) sharedState.census = body.census;
-      if (body.kpi) sharedState.kpi = { ...sharedState.kpi, ...body.kpi };
-      if (body.fin) sharedState.fin = { ...sharedState.fin, ...body.fin };
-      if (body.snapshot) sharedState.snapshot = { ...sharedState.snapshot, ...body.snapshot };
-      // Clinical KPI weekly submission — upsert by week_of, cap at 52 entries
-      if (body.clinical_kpi_entry && body.clinical_kpi_entry.week_of) {
-        sharedState.clinical_kpis = Array.isArray(sharedState.clinical_kpis) ? sharedState.clinical_kpis : [];
-        const wk = body.clinical_kpi_entry.week_of;
-        const idx = sharedState.clinical_kpis.findIndex(e => e && e.week_of === wk);
-        if (idx >= 0) sharedState.clinical_kpis[idx] = body.clinical_kpi_entry;
-        else sharedState.clinical_kpis.push(body.clinical_kpi_entry);
-        // Sort ascending by week_of so consumers (sparklines) can read left→right.
-        sharedState.clinical_kpis.sort((a, b) => (a.week_of || '').localeCompare(b.week_of || ''));
-        if (sharedState.clinical_kpis.length > 52) {
-          sharedState.clinical_kpis = sharedState.clinical_kpis.slice(-52);
+      // Merge incoming state with existing state — all writes are validated.
+      const censusN = safeInt(body.census, 0, 50);
+      if (censusN !== null) sharedState.census = censusN;
+      // kpi/fin: free-form objects, just shallow-merge (legacy compatibility).
+      if (body.kpi && typeof body.kpi === 'object') sharedState.kpi = { ...sharedState.kpi, ...body.kpi };
+      if (body.fin && typeof body.fin === 'object') sharedState.fin = { ...sharedState.fin, ...body.fin };
+      // Snapshot: each tile value is short text; cap at 80 chars.
+      if (body.snapshot && typeof body.snapshot === 'object') {
+        const cleanSnapshot = {};
+        for (const [k, v] of Object.entries(body.snapshot)) {
+          const key = safeText(k, 32);
+          if (key) cleanSnapshot[key] = safeText(v, 80);
+        }
+        sharedState.snapshot = { ...sharedState.snapshot, ...cleanSnapshot };
+      }
+      // Clinical KPI weekly submission (Jennifer) — validated upsert by week_of, cap 52
+      if (body.clinical_kpi_entry) {
+        const e = body.clinical_kpi_entry;
+        const wk = safeWeekOf(e.week_of);
+        if (wk) {
+          const entry = {
+            week_of: wk,
+            plans_reviewed:    safeInt(e.plans_reviewed,    0, 1000) ?? 0,
+            plans_sent_back:   safeInt(e.plans_sent_back,   0, 1000) ?? 0,
+            plans_72hr:        safeInt(e.plans_72hr,        0, 100)  ?? 0,
+            critical_incidents:safeInt(e.critical_incidents,0, 1000) ?? 0,
+            supervision_hours: safeFloat(e.supervision_hours,0, 1000) ?? 0,
+            submitted_by: safeText(e.submitted_by, 100) || 'unknown',
+            submitted_at: Date.now()
+          };
+          sharedState.clinical_kpis = Array.isArray(sharedState.clinical_kpis) ? sharedState.clinical_kpis : [];
+          const idx = sharedState.clinical_kpis.findIndex(x => x && x.week_of === wk);
+          if (idx >= 0) sharedState.clinical_kpis[idx] = entry;
+          else sharedState.clinical_kpis.push(entry);
+          sharedState.clinical_kpis.sort((a, b) => (a.week_of || '').localeCompare(b.week_of || ''));
+          if (sharedState.clinical_kpis.length > 52) sharedState.clinical_kpis = sharedState.clinical_kpis.slice(-52);
         }
       }
-      // Operations KPI weekly submission (Dylan) — same upsert pattern
-      if (body.operations_kpi_entry && body.operations_kpi_entry.week_of) {
-        sharedState.operations_kpis = Array.isArray(sharedState.operations_kpis) ? sharedState.operations_kpis : [];
-        const wk = body.operations_kpi_entry.week_of;
-        const idx = sharedState.operations_kpis.findIndex(e => e && e.week_of === wk);
-        if (idx >= 0) sharedState.operations_kpis[idx] = body.operations_kpi_entry;
-        else sharedState.operations_kpis.push(body.operations_kpi_entry);
-        sharedState.operations_kpis.sort((a, b) => (a.week_of || '').localeCompare(b.week_of || ''));
-        if (sharedState.operations_kpis.length > 52) {
-          sharedState.operations_kpis = sharedState.operations_kpis.slice(-52);
+      // Operations KPI weekly submission (Dylan)
+      if (body.operations_kpi_entry) {
+        const e = body.operations_kpi_entry;
+        const wk = safeWeekOf(e.week_of);
+        if (wk) {
+          const entry = {
+            week_of: wk,
+            avg_census: safeFloat(e.avg_census, 0, 50) ?? 0,
+            admits:     safeInt(e.admits,       0, 1000) ?? 0,
+            discharges: safeInt(e.discharges,   0, 1000) ?? 0,
+            submitted_by: safeText(e.submitted_by, 100) || 'unknown',
+            submitted_at: Date.now()
+          };
+          sharedState.operations_kpis = Array.isArray(sharedState.operations_kpis) ? sharedState.operations_kpis : [];
+          const idx = sharedState.operations_kpis.findIndex(x => x && x.week_of === wk);
+          if (idx >= 0) sharedState.operations_kpis[idx] = entry;
+          else sharedState.operations_kpis.push(entry);
+          sharedState.operations_kpis.sort((a, b) => (a.week_of || '').localeCompare(b.week_of || ''));
+          if (sharedState.operations_kpis.length > 52) sharedState.operations_kpis = sharedState.operations_kpis.slice(-52);
         }
       }
-      // Billing KPI monthly submission (Sheila) — upsert by month_of (YYYY-MM), cap at 36 (3 years)
-      if (body.billing_kpi_entry && body.billing_kpi_entry.month_of) {
-        sharedState.billing_kpis = Array.isArray(sharedState.billing_kpis) ? sharedState.billing_kpis : [];
-        const mo = body.billing_kpi_entry.month_of;
-        const idx = sharedState.billing_kpis.findIndex(e => e && e.month_of === mo);
-        if (idx >= 0) sharedState.billing_kpis[idx] = body.billing_kpi_entry;
-        else sharedState.billing_kpis.push(body.billing_kpi_entry);
-        sharedState.billing_kpis.sort((a, b) => (a.month_of || '').localeCompare(b.month_of || ''));
-        if (sharedState.billing_kpis.length > 36) {
-          sharedState.billing_kpis = sharedState.billing_kpis.slice(-36);
+      // Billing KPI monthly submission (Sheila) — upsert by month_of (YYYY-MM), cap 36
+      if (body.billing_kpi_entry) {
+        const e = body.billing_kpi_entry;
+        const mo = safeMonthOf(e.month_of);
+        if (mo) {
+          const entry = {
+            month_of: mo,
+            total_billed:    safeFloat(e.total_billed,    0, 10000000) ?? 0,
+            total_collected: safeFloat(e.total_collected, 0, 10000000) ?? 0,
+            denial_rate:     safeFloat(e.denial_rate,     0, 100)      ?? 0,
+            claims_count:    safeInt(e.claims_count,      0, 100000)   ?? 0,
+            total_ar:        safeFloat(e.total_ar,        0, 10000000) ?? 0,
+            // pdf URLs come from our own /billing-report-upload — validate as URL-ish text.
+            pdf_url:      safeText(e.pdf_url, 500) || null,
+            pdf_task_url: safeText(e.pdf_task_url, 500) || null,
+            submitted_by: safeText(e.submitted_by, 100) || 'unknown',
+            submitted_at: Date.now()
+          };
+          sharedState.billing_kpis = Array.isArray(sharedState.billing_kpis) ? sharedState.billing_kpis : [];
+          const idx = sharedState.billing_kpis.findIndex(x => x && x.month_of === mo);
+          if (idx >= 0) sharedState.billing_kpis[idx] = entry;
+          else sharedState.billing_kpis.push(entry);
+          sharedState.billing_kpis.sort((a, b) => (a.month_of || '').localeCompare(b.month_of || ''));
+          if (sharedState.billing_kpis.length > 36) sharedState.billing_kpis = sharedState.billing_kpis.slice(-36);
         }
       }
-      // Marketing KPI weekly submission (Jamie) — upsert by week_of, cap at 52
-      if (body.marketing_kpi_entry && body.marketing_kpi_entry.week_of) {
-        sharedState.marketing_kpis = Array.isArray(sharedState.marketing_kpis) ? sharedState.marketing_kpis : [];
-        const wk = body.marketing_kpi_entry.week_of;
-        const idx = sharedState.marketing_kpis.findIndex(e => e && e.week_of === wk);
-        if (idx >= 0) sharedState.marketing_kpis[idx] = body.marketing_kpi_entry;
-        else sharedState.marketing_kpis.push(body.marketing_kpi_entry);
-        sharedState.marketing_kpis.sort((a, b) => (a.week_of || '').localeCompare(b.week_of || ''));
-        if (sharedState.marketing_kpis.length > 52) {
-          sharedState.marketing_kpis = sharedState.marketing_kpis.slice(-52);
+      // Marketing KPI weekly submission (Jamie)
+      if (body.marketing_kpi_entry) {
+        const e = body.marketing_kpi_entry;
+        const wk = safeWeekOf(e.week_of);
+        if (wk) {
+          const entry = {
+            week_of: wk,
+            social_posts:    safeInt(e.social_posts,    0, 10000)   ?? 0,
+            inquiries:       safeInt(e.inquiries,       0, 10000)   ?? 0,
+            marketing_hours: safeFloat(e.marketing_hours,0, 168)    ?? 0,  // max 168 hrs/week
+            ad_spend:        safeFloat(e.ad_spend,      0, 1000000) ?? 0,
+            submitted_by: safeText(e.submitted_by, 100) || 'unknown',
+            submitted_at: Date.now()
+          };
+          sharedState.marketing_kpis = Array.isArray(sharedState.marketing_kpis) ? sharedState.marketing_kpis : [];
+          const idx = sharedState.marketing_kpis.findIndex(x => x && x.week_of === wk);
+          if (idx >= 0) sharedState.marketing_kpis[idx] = entry;
+          else sharedState.marketing_kpis.push(entry);
+          sharedState.marketing_kpis.sort((a, b) => (a.week_of || '').localeCompare(b.week_of || ''));
+          if (sharedState.marketing_kpis.length > 52) sharedState.marketing_kpis = sharedState.marketing_kpis.slice(-52);
         }
       }
       // Persist to ClickUp task description (fire-and-forget — don't block response).
@@ -554,13 +648,14 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url === '/assign') {
     try {
       const body = await parseBody(req);
-      const { task_id, assignee_id } = body;
+      const task_id     = safeText(body.task_id, 50);
+      const assignee_id = safeInt(body.assignee_id, 1, 999999999);
       if (!task_id) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false, error: 'task_id required' }));
         return;
       }
-      const payload = assignee_id ? { assignees: [assignee_id] } : { assignees: [] };
+      const payload = assignee_id !== null ? { assignees: [assignee_id] } : { assignees: [] };
       const result = await clickupRequest('PUT', `/task/${task_id}`, payload);
       cache = null;
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -576,7 +671,8 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url === '/status') {
     try {
       const body = await parseBody(req);
-      const { task_id, status } = body;
+      const task_id = safeText(body.task_id, 50);
+      const status  = safeText(body.status, 50);
       if (!task_id || !status) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false, error: 'task_id and status required' }));
@@ -611,25 +707,32 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url === '/outreach') {
     try {
       const body = await parseBody(req);
-      const { partner_name, status, contact_name, contact_info, partner_type, last_touch, next_action, notes } = body;
 
-      if (!partner_name || !partner_name.trim()) {
+      const partner_name = safeText(body.partner_name, 200);
+      if (!partner_name) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false, error: 'partner_name is required' }));
         return;
       }
+      const contact_name = safeText(body.contact_name, 200);
+      const contact_info = safeText(body.contact_info, 200);
+      const next_action  = safeText(body.next_action,  500);
+      const notes        = safeText(body.notes,        2000);
+      const partner_type = safeText(body.partner_type, 100);  // ClickUp dropdown UUID
+      const last_touch   = safeInt(body.last_touch, 0, 9999999999999);  // unix ms
+      const status       = safeEnum(body.status, ['Cold','Scheduled','Active','Dormant','Closed']);
 
       // Only include custom fields that have values
       const custom_fields = [];
       if (contact_name) custom_fields.push({ id: PARTNER_FIELDS.contact_name, value: contact_name });
       if (contact_info) custom_fields.push({ id: PARTNER_FIELDS.contact_info, value: contact_info });
       if (partner_type) custom_fields.push({ id: PARTNER_FIELDS.partner_type, value: partner_type });
-      if (last_touch)   custom_fields.push({ id: PARTNER_FIELDS.last_touch,   value: parseInt(last_touch) });
+      if (last_touch !== null) custom_fields.push({ id: PARTNER_FIELDS.last_touch, value: last_touch });
       if (next_action)  custom_fields.push({ id: PARTNER_FIELDS.next_action,  value: next_action });
 
       const payload = {
-        name: partner_name.trim(),
-        description: notes || '',
+        name: partner_name,
+        description: notes,
         ...(status ? { status } : {}),
         ...(custom_fields.length > 0 ? { custom_fields } : {})
       };
@@ -681,25 +784,32 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url === '/referrals') {
     try {
       const body = await parseBody(req);
-      const { initials, status, source_name, source_type, source_contact, date_received, asam_level, notes_outcome } = body;
 
-      if (!initials || !initials.trim()) {
+      const initials = safeText(body.initials, 50);
+      if (!initials) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false, error: 'initials is required' }));
         return;
       }
+      const source_name    = safeText(body.source_name,    200);
+      const source_type    = safeText(body.source_type,    100);  // dropdown UUID
+      const source_contact = safeText(body.source_contact, 200);
+      const asam_level     = safeText(body.asam_level,     20);
+      const notes_outcome  = safeText(body.notes_outcome,  2000);
+      const date_received  = safeInt(body.date_received, 0, 9999999999999);
+      const status         = safeEnum(body.status, ['New','Assessment','Admitted','Declined']);
 
       const custom_fields = [];
       if (source_name)    custom_fields.push({ id: REFERRAL_FIELDS.source_name,    value: source_name });
       if (source_type)    custom_fields.push({ id: REFERRAL_FIELDS.source_type,    value: source_type });
       if (source_contact) custom_fields.push({ id: REFERRAL_FIELDS.source_contact, value: source_contact });
-      if (date_received)  custom_fields.push({ id: REFERRAL_FIELDS.date_received,  value: parseInt(date_received) });
+      if (date_received !== null) custom_fields.push({ id: REFERRAL_FIELDS.date_received, value: date_received });
       if (asam_level)     custom_fields.push({ id: REFERRAL_FIELDS.asam_level,     value: asam_level });
       if (notes_outcome)  custom_fields.push({ id: REFERRAL_FIELDS.notes_outcome,  value: notes_outcome });
 
       const payload = {
-        name: initials.trim(),
-        description: notes_outcome || '',
+        name: initials,
+        description: notes_outcome,
         ...(status ? { status } : {}),
         ...(custom_fields.length > 0 ? { custom_fields } : {})
       };
@@ -748,23 +858,28 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url === '/ar') {
     try {
       const body = await parseBody(req);
-      const { initials, status, amount, date_of_service, reason_status_note, payer } = body;
 
-      if (!initials || !initials.trim()) {
+      const initials = safeText(body.initials, 50);
+      if (!initials) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false, error: 'initials is required' }));
         return;
       }
+      const amount             = safeFloat(body.amount, 0, 10000000);
+      const date_of_service    = safeInt(body.date_of_service, 0, 9999999999999);
+      const reason_status_note = safeText(body.reason_status_note, 1000);
+      const payer              = safeText(body.payer, 200);
+      const status             = safeEnum(body.status, ['Open','Working','Resolved']);
 
       const custom_fields = [];
-      if (amount !== undefined && amount !== null && amount !== '') custom_fields.push({ id: AR_FIELDS.amount, value: parseFloat(amount) });
-      if (date_of_service) custom_fields.push({ id: AR_FIELDS.date_of_service, value: parseInt(date_of_service) });
+      if (amount !== null) custom_fields.push({ id: AR_FIELDS.amount, value: amount });
+      if (date_of_service !== null) custom_fields.push({ id: AR_FIELDS.date_of_service, value: date_of_service });
       if (reason_status_note) custom_fields.push({ id: AR_FIELDS.reason_status_note, value: reason_status_note });
       if (payer) custom_fields.push({ id: AR_FIELDS.payer, value: payer });
 
       const payload = {
-        name: initials.trim(),
-        description: reason_status_note || '',
+        name: initials,
+        description: reason_status_note,
         ...(status ? { status } : {}),
         ...(custom_fields.length > 0 ? { custom_fields } : {})
       };
@@ -801,15 +916,19 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url === '/billing-report-upload') {
     try {
       const body = await parseBody(req);
-      const { month_of, filename, base64 } = body;
-      if (!month_of || !/^\d{4}-\d{2}$/.test(month_of)) {
+      const month_of = safeMonthOf(body.month_of);
+      if (!month_of) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false, error: 'month_of (YYYY-MM) is required' }));
         return;
       }
-      if (!filename || !base64) {
+      // Filename: strip HTML / dangerous chars, cap to 200. Force .pdf extension if missing.
+      let filename = safeText(body.filename, 200) || 'billing.pdf';
+      if (!/\.pdf$/i.test(filename)) filename += '.pdf';
+      const base64 = body.base64;
+      if (!base64 || typeof base64 !== 'string') {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false, error: 'filename and base64 are required' }));
+        res.end(JSON.stringify({ success: false, error: 'base64 is required (string)' }));
         return;
       }
       let fileBuffer;
