@@ -56,6 +56,11 @@ const AR_FIELDS = {
 const BILLING_REPORTS_LIST_ID = '901713712222';
 const MAX_PDF_BYTES = 10 * 1024 * 1024; // 10 MB cap on uploaded PDFs
 
+// Persistent state task — sharedState is JSON.stringify'd into this task's
+// description after every POST /state, and hydrated from it on server boot.
+// Survives Railway restarts. Single source of truth across replicas.
+const STATE_TASK_ID = '86e1bu3ar';
+
 // Shared state — persists in memory on the server, same for all users
 // NOTE: snapshot key holds Operating Snapshot tile values (netDelta, partners,
 // collection, incidents, plans72) so all admins see the same values.
@@ -114,6 +119,62 @@ function clickupRequest(method, path, body) {
     if (data) req.write(data);
     req.end();
   });
+}
+
+// ───── Persistent state helpers (Approach B) ─────
+// hydrateState: called once on server boot. Reads STATE_TASK_ID's description,
+// parses it as JSON, and merges into sharedState. Handles empty / malformed
+// gracefully — server still boots with defaults if the read fails.
+async function hydrateState() {
+  if (!STATE_TASK_ID) return;
+  try {
+    const task = await clickupRequest('GET', `/task/${STATE_TASK_ID}`);
+    if (!task || !task.description) {
+      console.log('State hydrate: task has no description, starting from defaults');
+      return;
+    }
+    const parsed = JSON.parse(task.description);
+    if (parsed && typeof parsed === 'object') {
+      Object.assign(sharedState, parsed);
+      const counts = {
+        snapshot: Object.keys(sharedState.snapshot || {}).length,
+        clinical: (sharedState.clinical_kpis || []).length,
+        operations: (sharedState.operations_kpis || []).length,
+        billing: (sharedState.billing_kpis || []).length,
+        marketing: (sharedState.marketing_kpis || []).length
+      };
+      console.log('State hydrated from ClickUp:', JSON.stringify(counts));
+    }
+  } catch(e) {
+    console.error('State hydrate failed:', e.message, '— continuing with defaults');
+  }
+}
+
+// persistState: called fire-and-forget after every successful POST /state body
+// merge. Writes JSON.stringify(sharedState) to the task description. Failures
+// are logged but don't affect the response (state still lives in memory).
+let _persistInFlight = false;
+let _persistPending = false;
+async function persistState() {
+  if (!STATE_TASK_ID) return;
+  // Coalesce concurrent writes: if one is already in flight, mark pending and
+  // run another after it completes. Prevents losing the latest state to an
+  // older writer that happened to finish later.
+  if (_persistInFlight) { _persistPending = true; return; }
+  _persistInFlight = true;
+  try {
+    const body = JSON.stringify(sharedState);
+    await clickupRequest('PUT', `/task/${STATE_TASK_ID}`, { description: body });
+  } catch(e) {
+    console.error('State persist failed:', e.message);
+  } finally {
+    _persistInFlight = false;
+    if (_persistPending) {
+      _persistPending = false;
+      // Run another immediately to capture any state that arrived while we were busy.
+      persistState();
+    }
+  }
 }
 
 async function getAllTasks() {
@@ -447,7 +508,9 @@ const server = http.createServer(async (req, res) => {
           sharedState.marketing_kpis = sharedState.marketing_kpis.slice(-52);
         }
       }
-      console.log('Shared state updated:', JSON.stringify(sharedState));
+      // Persist to ClickUp task description (fire-and-forget — don't block response).
+      persistState();
+      console.log('Shared state updated:', JSON.stringify(sharedState).slice(0, 200) + '...');
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, state: sharedState }));
     } catch(e) {
@@ -780,4 +843,8 @@ server.listen(PORT, () => {
   if (!API_TOKEN) console.warn('WARNING: CLICKUP_API_TOKEN not set');
   if (!DASHBOARD_TOKEN) console.warn('WARNING: DASHBOARD_TOKEN not set — auth enforcement DISABLED');
   else console.log('Auth enabled — DASHBOARD_TOKEN required on all routes except /health');
+  // Hydrate sharedState from the persistent ClickUp task. Does NOT block the
+  // listen() — first few GET /state calls during boot may return defaults
+  // briefly until hydration completes (~500ms). Acceptable for a small tool.
+  hydrateState();
 });
