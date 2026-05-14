@@ -127,10 +127,6 @@ function clickupRequest(method, path, body) {
 }
 
 // ───── Persistent state helpers (Approach B) ─────
-// hydrateState: read the most recent comment on STATE_TASK_ID. Each persist
-// posts a new comment containing the JSON blob; hydrate restores from the
-// latest. We use comments instead of the task description because ClickUp's
-// PUT /task silently drops description writes for this account. Comments work.
 async function hydrateState() {
   if (!STATE_TASK_ID) return;
   try {
@@ -140,10 +136,7 @@ async function hydrateState() {
       console.log('State hydrate: no comments yet, starting from defaults');
       return;
     }
-    // Comments are typically returned in reverse-chronological order; sort to be safe.
     comments.sort((a, b) => parseInt(b.date || 0) - parseInt(a.date || 0));
-    // Find the most recent comment that contains valid JSON (skip any manual
-    // human-entered comments that aren't state blobs).
     for (const c of comments) {
       const text = (c.comment_text || '').trim();
       if (!text || text === '{}') continue;
@@ -162,7 +155,6 @@ async function hydrateState() {
           return;
         }
       } catch(parseErr) {
-        // Not JSON — try the next-most-recent comment.
         continue;
       }
     }
@@ -172,23 +164,14 @@ async function hydrateState() {
   }
 }
 
-// persistState: called fire-and-forget after every successful POST /state body
-// merge. Writes JSON.stringify(sharedState) to the task description. Failures
-// are logged but don't affect the response (state still lives in memory).
 let _persistInFlight = false;
 let _persistPending = false;
 async function persistState() {
   if (!STATE_TASK_ID) return;
-  // Coalesce concurrent writes: if one is already in flight, mark pending and
-  // run another after it completes. Prevents losing the latest state to an
-  // older writer that happened to finish later.
   if (_persistInFlight) { _persistPending = true; return; }
   _persistInFlight = true;
   try {
     const json = JSON.stringify(sharedState);
-    // Persist by appending a comment to STATE_TASK_ID. Each comment is the
-    // raw JSON blob. hydrateState reads the most recent one. Old comments
-    // accumulate harmlessly (could be cleaned up periodically — phase 4 nice-to-have).
     const result = await clickupRequest('POST', `/task/${STATE_TASK_ID}/comment`, {
       comment_text: json,
       notify_all: false
@@ -206,7 +189,6 @@ async function persistState() {
     _persistInFlight = false;
     if (_persistPending) {
       _persistPending = false;
-      // Run another immediately to capture any state that arrived while we were busy.
       persistState();
     }
   }
@@ -249,7 +231,6 @@ async function getCachedTasks(force) {
   return cache;
 }
 
-// Outreach cache (separate from main task cache, shorter TTL)
 let outreachCache = null;
 let outreachCacheTime = 0;
 const OUTREACH_TTL = 30 * 1000;
@@ -293,7 +274,6 @@ async function getCachedOutreach(force) {
   return outreachCache;
 }
 
-// Referrals cache (mirrors outreach pattern)
 let referralCache = null;
 let referralCacheTime = 0;
 const REFERRAL_TTL = 30 * 1000;
@@ -338,7 +318,6 @@ async function getCachedReferrals(force) {
   return referralCache;
 }
 
-// AR Aging cache (mirrors referrals pattern)
 let arCache = null;
 let arCacheTime = 0;
 const AR_TTL = 30 * 1000;
@@ -387,15 +366,12 @@ function parseBody(req) {
 }
 
 // ───── Input validation helpers (Phase 4.1) ─────
-// safeText: coerce to string, strip HTML tags, trim, truncate to maxLen.
-// Always returns a string (possibly empty). Use for free-text user fields.
 function safeText(value, maxLen) {
   if (value == null) return '';
   let s = String(value).replace(/<[^>]*>/g, '').trim();
   if (maxLen && s.length > maxLen) s = s.slice(0, maxLen);
   return s;
 }
-// safeInt: parse integer with optional bounds. Returns null if invalid/out-of-range.
 function safeInt(value, min, max) {
   const n = parseInt(value, 10);
   if (!Number.isFinite(n)) return null;
@@ -403,7 +379,6 @@ function safeInt(value, min, max) {
   if (max !== undefined && n > max) return null;
   return n;
 }
-// safeFloat: parse float with optional bounds. Returns null if invalid/out-of-range.
 function safeFloat(value, min, max) {
   const n = parseFloat(value);
   if (!Number.isFinite(n)) return null;
@@ -411,24 +386,20 @@ function safeFloat(value, min, max) {
   if (max !== undefined && n > max) return null;
   return n;
 }
-// safeWeekOf: enforce YYYY-MM-DD format. Returns the string if valid, else null.
 function safeWeekOf(value) {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
   return value;
 }
-// safeMonthOf: enforce YYYY-MM format. Returns the string if valid, else null.
 function safeMonthOf(value) {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}$/.test(value)) return null;
   return value;
 }
-// safeEnum: return value if it's in the allowed list, else null.
 function safeEnum(value, allowed) {
   if (typeof value !== 'string') return null;
   return allowed.includes(value) ? value : null;
 }
 
 // ───── Billing report PDF helpers ─────
-// Find a task in BILLING_REPORTS_LIST_ID named monthOf (e.g. "2026-04"); create it if missing.
 async function findOrCreateBillingReportTask(monthOf) {
   const data = await clickupRequest('GET', `/list/${BILLING_REPORTS_LIST_ID}/task?include_closed=true&subtasks=false`);
   const existing = (data.tasks || []).find(t => t.name === monthOf);
@@ -437,8 +408,6 @@ async function findOrCreateBillingReportTask(monthOf) {
   return created;
 }
 
-// Upload a binary file as a ClickUp task attachment using vanilla Node.js
-// multipart/form-data — no external deps. Returns the parsed JSON response.
 function clickupAttachmentUpload(taskId, filename, contentType, fileBuffer) {
   return new Promise((resolve, reject) => {
     const boundary = '----BHBoundary' + Date.now() + Math.random().toString(36).slice(2);
@@ -476,8 +445,6 @@ function clickupAttachmentUpload(taskId, filename, contentType, fileBuffer) {
 }
 
 // ───── Anthropic API helper for billing PDF extraction (Phase 4.5) ─────
-// Calls api.anthropic.com Messages endpoint with the PDF as a document content
-// block. Returns the parsed JSON response body. Throws on network or HTTP error.
 function anthropicRequest(body) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
@@ -514,11 +481,6 @@ function anthropicRequest(body) {
   });
 }
 
-// extractBillingFields: pass Sheila's monthly billing PDF to Claude Haiku and
-// pull out the 5 numeric fields. Returns:
-//   { total_billed, total_collected, denial_rate, claims_count, total_ar }
-// All values are numbers (or null if the model couldn't find them).
-// Throws if API call fails or response doesn't parse — caller handles fallback.
 async function extractBillingFields(pdfBase64) {
   const prompt = [
     'You are extracting five numeric fields from a monthly billing report PDF.',
@@ -563,19 +525,13 @@ async function extractBillingFields(pdfBase64) {
     ]
   });
 
-  // Pull the text block from the response.
   const textBlock = (resp.content || []).find(b => b.type === 'text');
   const raw = (textBlock && textBlock.text) ? textBlock.text.trim() : '';
   if (!raw) throw new Error('Anthropic returned no text content');
-
-  // Strip possible code fences just in case the model adds them despite the prompt.
   const stripped = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-
   let parsed;
   try { parsed = JSON.parse(stripped); }
   catch (e) { throw new Error('Model output was not valid JSON: ' + stripped.slice(0, 200)); }
-
-  // Normalize: coerce each field to a number (or null) and validate ranges.
   const out = {
     total_billed:    safeFloat(parsed.total_billed,    0, 10000000),
     total_collected: safeFloat(parsed.total_collected, 0, 10000000),
@@ -584,6 +540,40 @@ async function extractBillingFields(pdfBase64) {
     total_ar:        safeFloat(parsed.total_ar,        0, 10000000)
   };
   return out;
+}
+
+// ───── Outreach follow-up subtasks (Phase 4.6) ─────
+// createOutreachFollowupSubtask: creates a subtask under a partner outreach
+// task representing a planned follow-up action with a due date. The subtask
+// surfaces in Neshel's ClickUp queue automatically with the picked due date
+// so she never has to remember to chase a partner.
+//   parentTaskId: id of the partner outreach task just created/updated
+//   actionLabel:  human label, e.g. "Call back in 1 week", "Send proposal"
+//   dueDateMs:    unix ms timestamp for the due date
+//   meetingWith:  optional name of the team member when action is a meeting
+//   partnerName:  partner's name (for the description)
+async function createOutreachFollowupSubtask(parentTaskId, params) {
+  const { actionLabel, dueDateMs, meetingWith, partnerName } = params;
+  let subtaskName;
+  if (meetingWith) {
+    subtaskName = 'Meeting with ' + meetingWith;
+  } else {
+    subtaskName = actionLabel || 'Follow up';
+  }
+  const descLines = [
+    'Auto-created from outreach log.',
+    partnerName ? 'Partner: ' + partnerName : '',
+    meetingWith ? 'Scheduled with: ' + meetingWith : '',
+    'Action: ' + (actionLabel || '(none)'),
+  ].filter(Boolean);
+  const payload = {
+    name: subtaskName,
+    description: descLines.join('\n'),
+    parent: parentTaskId,
+    due_date: dueDateMs,
+    due_date_time: false
+  };
+  return clickupRequest('POST', `/list/${PARTNER_LIST_ID}/task`, payload);
 }
 
 function setCORS(res) {
@@ -606,8 +596,6 @@ const server = http.createServer(async (req, res) => {
   const query = req.url.includes('?') ? req.url.split('?')[1] : '';
   const force = query.includes('refresh=true');
 
-  // Auth check — only enforced when DASHBOARD_TOKEN env var is set.
-  // /health stays public (monitoring); everything else requires the header.
   if (DASHBOARD_TOKEN && url !== '/health') {
     const provided = req.headers['x-dashboard-token'];
     if (provided !== DASHBOARD_TOKEN) {
@@ -617,7 +605,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // GET tasks
   if (req.method === 'GET' && url === '/tasks') {
     try {
       const tasks = await getCachedTasks(force);
@@ -630,24 +617,19 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // GET shared state — census, kpi, fin data
   if (req.method === 'GET' && url === '/state') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ success: true, state: sharedState }));
     return;
   }
 
-  // POST shared state — only owner can update census
   if (req.method === 'POST' && url === '/state') {
     try {
       const body = await parseBody(req);
-      // Merge incoming state with existing state — all writes are validated.
       const censusN = safeInt(body.census, 0, 50);
       if (censusN !== null) sharedState.census = censusN;
-      // kpi/fin: free-form objects, just shallow-merge (legacy compatibility).
       if (body.kpi && typeof body.kpi === 'object') sharedState.kpi = { ...sharedState.kpi, ...body.kpi };
       if (body.fin && typeof body.fin === 'object') sharedState.fin = { ...sharedState.fin, ...body.fin };
-      // Snapshot: each tile value is short text; cap at 80 chars.
       if (body.snapshot && typeof body.snapshot === 'object') {
         const cleanSnapshot = {};
         for (const [k, v] of Object.entries(body.snapshot)) {
@@ -656,7 +638,6 @@ const server = http.createServer(async (req, res) => {
         }
         sharedState.snapshot = { ...sharedState.snapshot, ...cleanSnapshot };
       }
-      // Clinical KPI weekly submission (Jennifer) — validated upsert by week_of, cap 52
       if (body.clinical_kpi_entry) {
         const e = body.clinical_kpi_entry;
         const wk = safeWeekOf(e.week_of);
@@ -679,7 +660,6 @@ const server = http.createServer(async (req, res) => {
           if (sharedState.clinical_kpis.length > 52) sharedState.clinical_kpis = sharedState.clinical_kpis.slice(-52);
         }
       }
-      // Operations KPI weekly submission (Dylan)
       if (body.operations_kpi_entry) {
         const e = body.operations_kpi_entry;
         const wk = safeWeekOf(e.week_of);
@@ -700,7 +680,6 @@ const server = http.createServer(async (req, res) => {
           if (sharedState.operations_kpis.length > 52) sharedState.operations_kpis = sharedState.operations_kpis.slice(-52);
         }
       }
-      // Billing KPI monthly submission (Sheila) — upsert by month_of (YYYY-MM), cap 36
       if (body.billing_kpi_entry) {
         const e = body.billing_kpi_entry;
         const mo = safeMonthOf(e.month_of);
@@ -712,7 +691,6 @@ const server = http.createServer(async (req, res) => {
             denial_rate:     safeFloat(e.denial_rate,     0, 100)      ?? 0,
             claims_count:    safeInt(e.claims_count,      0, 100000)   ?? 0,
             total_ar:        safeFloat(e.total_ar,        0, 10000000) ?? 0,
-            // pdf URLs come from our own /billing-report-upload — validate as URL-ish text.
             pdf_url:      safeText(e.pdf_url, 500) || null,
             pdf_task_url: safeText(e.pdf_task_url, 500) || null,
             submitted_by: safeText(e.submitted_by, 100) || 'unknown',
@@ -726,7 +704,6 @@ const server = http.createServer(async (req, res) => {
           if (sharedState.billing_kpis.length > 36) sharedState.billing_kpis = sharedState.billing_kpis.slice(-36);
         }
       }
-      // Marketing KPI weekly submission (Jamie)
       if (body.marketing_kpi_entry) {
         const e = body.marketing_kpi_entry;
         const wk = safeWeekOf(e.week_of);
@@ -735,7 +712,7 @@ const server = http.createServer(async (req, res) => {
             week_of: wk,
             social_posts:    safeInt(e.social_posts,    0, 10000)   ?? 0,
             inquiries:       safeInt(e.inquiries,       0, 10000)   ?? 0,
-            marketing_hours: safeFloat(e.marketing_hours,0, 168)    ?? 0,  // max 168 hrs/week
+            marketing_hours: safeFloat(e.marketing_hours,0, 168)    ?? 0,
             ad_spend:        safeFloat(e.ad_spend,      0, 1000000) ?? 0,
             submitted_by: safeText(e.submitted_by, 100) || 'unknown',
             submitted_at: Date.now()
@@ -748,7 +725,6 @@ const server = http.createServer(async (req, res) => {
           if (sharedState.marketing_kpis.length > 52) sharedState.marketing_kpis = sharedState.marketing_kpis.slice(-52);
         }
       }
-      // Persist to ClickUp task description (fire-and-forget — don't block response).
       persistState();
       console.log('Shared state updated:', JSON.stringify(sharedState).slice(0, 200) + '...');
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -760,7 +736,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST assign
   if (req.method === 'POST' && url === '/assign') {
     try {
       const body = await parseBody(req);
@@ -783,7 +758,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST status
   if (req.method === 'POST' && url === '/status') {
     try {
       const body = await parseBody(req);
@@ -805,7 +779,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // GET outreach — fetch all tasks from Partner Outreach Pipeline (with custom fields parsed)
   if (req.method === 'GET' && url === '/outreach') {
     try {
       const tasks = await getCachedOutreach(force);
@@ -819,7 +792,10 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST outreach — create new partner outreach task in the Partner Outreach Pipeline list
+  // POST outreach — create new partner outreach task. NEW IN 4.6: if the
+  // request includes next_action_date (and optionally meeting_with), we also
+  // create a subtask under the new partner task with that due date so it
+  // appears in Neshel's ClickUp queue automatically as a follow-up.
   if (req.method === 'POST' && url === '/outreach') {
     try {
       const body = await parseBody(req);
@@ -834,11 +810,14 @@ const server = http.createServer(async (req, res) => {
       const contact_info = safeText(body.contact_info, 200);
       const next_action  = safeText(body.next_action,  500);
       const notes        = safeText(body.notes,        2000);
-      const partner_type = safeText(body.partner_type, 100);  // ClickUp dropdown UUID
-      const last_touch   = safeInt(body.last_touch, 0, 9999999999999);  // unix ms
+      const partner_type = safeText(body.partner_type, 100);
+      const last_touch   = safeInt(body.last_touch, 0, 9999999999999);
       const status       = safeEnum(body.status, ['Cold','Scheduled','Active','Dormant','Closed']);
+      // New 4.6 fields — both optional. If next_action_date is set we'll
+      // create a follow-up subtask after the partner task is created.
+      const next_action_date = safeInt(body.next_action_date, 0, 9999999999999);
+      const meeting_with     = safeText(body.meeting_with, 100);
 
-      // Only include custom fields that have values
       const custom_fields = [];
       if (contact_name) custom_fields.push({ id: PARTNER_FIELDS.contact_name, value: contact_name });
       if (contact_info) custom_fields.push({ id: PARTNER_FIELDS.contact_info, value: contact_info });
@@ -855,7 +834,6 @@ const server = http.createServer(async (req, res) => {
 
       const result = await clickupRequest('POST', `/list/${PARTNER_LIST_ID}/task`, payload);
 
-      // ClickUp returns errors in the body, not via HTTP status — check explicitly
       if (result.err || result.errors) {
         console.error('ClickUp rejected outreach create:', JSON.stringify(result));
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -863,7 +841,30 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Invalidate outreach cache so the next GET picks up the new task
+      // Phase 4.6 — auto-create follow-up subtask if a date was picked.
+      // Failures here are logged but DON'T fail the parent create — the
+      // partner record is more important than the convenience subtask.
+      let followupResult = null;
+      if (next_action_date && result.id) {
+        try {
+          followupResult = await createOutreachFollowupSubtask(result.id, {
+            actionLabel: next_action,
+            dueDateMs: next_action_date,
+            meetingWith: meeting_with || null,
+            partnerName: partner_name
+          });
+          if (followupResult && (followupResult.err || followupResult.errors)) {
+            console.error('Follow-up subtask rejected:', JSON.stringify(followupResult).slice(0, 200));
+            followupResult = { error: followupResult.err || JSON.stringify(followupResult.errors) };
+          } else if (followupResult && followupResult.id) {
+            console.log(`Follow-up subtask created: ${followupResult.id} under ${result.id}`);
+          }
+        } catch(subErr) {
+          console.error('Follow-up subtask error:', subErr.message);
+          followupResult = { error: subErr.message };
+        }
+      }
+
       outreachCache = null;
       outreachCacheTime = 0;
 
@@ -871,7 +872,12 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         success: true,
-        task: { id: result.id, name: result.name, url: result.url, status: result.status?.status }
+        task: { id: result.id, name: result.name, url: result.url, status: result.status?.status },
+        followup: followupResult ? {
+          id: followupResult.id || null,
+          url: followupResult.url || null,
+          error: followupResult.error || null
+        } : null
       }));
     } catch(e) {
       console.error('Outreach create error:', e.message);
@@ -881,7 +887,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // GET referrals — fetch all tasks from BH Referrals (with custom fields parsed)
   if (req.method === 'GET' && url === '/referrals') {
     try {
       const tasks = await getCachedReferrals(force);
@@ -895,8 +900,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST referrals — create new referral record in the BH Referrals list.
-  // `initials` becomes the task name (patient initials only for privacy).
   if (req.method === 'POST' && url === '/referrals') {
     try {
       const body = await parseBody(req);
@@ -908,7 +911,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const source_name    = safeText(body.source_name,    200);
-      const source_type    = safeText(body.source_type,    100);  // dropdown UUID
+      const source_type    = safeText(body.source_type,    100);
       const source_contact = safeText(body.source_contact, 200);
       const asam_level     = safeText(body.asam_level,     20);
       const notes_outcome  = safeText(body.notes_outcome,  2000);
@@ -956,7 +959,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // GET ar — fetch all AR Aging tasks with custom fields parsed
   if (req.method === 'GET' && url === '/ar') {
     try {
       const tasks = await getCachedAR(force);
@@ -970,7 +972,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST ar — create a new AR line item. `initials` becomes the task name.
   if (req.method === 'POST' && url === '/ar') {
     try {
       const body = await parseBody(req);
@@ -1026,9 +1027,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST billing-report-upload — accept a base64-encoded PDF, attach it to the
-  // monthly task in BILLING_REPORTS_LIST_ID. Creates the task if it doesn't
-  // exist yet. Body: { month_of: "YYYY-MM", filename: "x.pdf", base64: "..." }
   if (req.method === 'POST' && url === '/billing-report-upload') {
     try {
       const body = await parseBody(req);
@@ -1038,7 +1036,6 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ success: false, error: 'month_of (YYYY-MM) is required' }));
         return;
       }
-      // Filename: strip HTML / dangerous chars, cap to 200. Force .pdf extension if missing.
       let filename = safeText(body.filename, 200) || 'billing.pdf';
       if (!/\.pdf$/i.test(filename)) filename += '.pdf';
       const base64 = body.base64;
@@ -1092,11 +1089,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST billing-extract — read a billing PDF via Claude and return the 5 KPI
-  // numbers (total_billed, total_collected, denial_rate, claims_count, total_ar).
-  // Body: { filename: "x.pdf", base64: "..." }. No write side effects; this is a
-  // pure read helper invoked before Sheila submits her monthly form. The frontend
-  // is expected to fall back to manual entry on any error (silent fallback).
   if (req.method === 'POST' && url === '/billing-extract') {
     try {
       if (!ANTHROPIC_API_KEY) {
@@ -1111,7 +1103,6 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ success: false, error: 'base64 is required (string)' }));
         return;
       }
-      // Validate size (same 10 MB cap as upload endpoint).
       let fileBuffer;
       try { fileBuffer = Buffer.from(base64, 'base64'); }
       catch (e) {
@@ -1142,7 +1133,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // GET health
   if (req.method === 'GET' && url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -1165,8 +1155,5 @@ server.listen(PORT, () => {
   else console.log('Auth enabled — DASHBOARD_TOKEN required on all routes except /health');
   if (!ANTHROPIC_API_KEY) console.warn('WARNING: ANTHROPIC_API_KEY not set — /billing-extract will return 503');
   else console.log('Anthropic API key detected — /billing-extract enabled');
-  // Hydrate sharedState from the persistent ClickUp task. Does NOT block the
-  // listen() — first few GET /state calls during boot may return defaults
-  // briefly until hydration completes (~500ms). Acceptable for a small tool.
   hydrateState();
 });
