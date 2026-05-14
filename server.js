@@ -25,6 +25,21 @@ const PILLAR_MAP = {
   '901712935573':'kpi','901712935575':'hr','901712935581':'fin',
 };
 
+// Team member name -> ClickUp user ID. Used by /outreach (Phase 4.6) to
+// auto-assign meeting follow-up subtasks to the person Neshel is meeting with,
+// which triggers a ClickUp notification to them. Names match the values in
+// the frontend Meeting With dropdown. Sheila is DWA Consulting in ClickUp.
+// Matt is not in this map yet — meetings with Matt will still be created but
+// without an assignee until his ClickUp user ID is added.
+const TEAM_MEMBER_IDS = {
+  'DT':           180152883,  // Dontae Scott
+  'Dylan':        101139872,  // Dylan Messal
+  'Dr. Jennifer': 95364912,   // Jennifer McChristian
+  'Sheila':       180295736,  // DWA Consulting
+  'Jamie':        95202610,   // Jamie Fry
+  // 'Matt':      pending — add ClickUp ID here when he's added to the workspace
+};
+
 // Partner Outreach Pipeline (Neshel's partner tracking)
 const PARTNER_LIST_ID = '901713563582';
 const PARTNER_FIELDS = {
@@ -67,17 +82,6 @@ const MAX_PDF_BYTES = 10 * 1024 * 1024; // 10 MB cap on uploaded PDFs
 const STATE_TASK_ID = '86e1bu3ar';
 
 // Shared state — persists in memory on the server, same for all users
-// NOTE: snapshot key holds Operating Snapshot tile values (netDelta, partners,
-// collection, incidents, plans72) so all admins see the same values.
-// clinical_kpis is an array of Dr. Jennifer's weekly submissions, upserted by
-// week_of (re-submitting the same week replaces, doesn't duplicate). Capped
-// at 52 entries (one year) to prevent unbounded growth.
-// operations_kpis follows the same pattern for Dylan's weekly snapshots
-// (avg_census, admits, discharges).
-// billing_kpis follows the same pattern for Sheila's monthly submissions
-// (upserted by month_of "YYYY-MM" instead of week_of).
-// marketing_kpis follows the weekly upsert pattern for Jamie's submissions
-// (social_posts, inquiries, marketing_hours, ad_spend).
 let sharedState = {
   census: 4,
   kpi: {},
@@ -552,8 +556,10 @@ async function extractBillingFields(pdfBase64) {
 //   dueDateMs:    unix ms timestamp for the due date
 //   meetingWith:  optional name of the team member when action is a meeting
 //   partnerName:  partner's name (for the description)
+//   assigneeId:   optional ClickUp user id; when provided, the subtask is
+//                 assigned to that person (triggers a ClickUp notification).
 async function createOutreachFollowupSubtask(parentTaskId, params) {
-  const { actionLabel, dueDateMs, meetingWith, partnerName } = params;
+  const { actionLabel, dueDateMs, meetingWith, partnerName, assigneeId } = params;
   let subtaskName;
   if (meetingWith) {
     subtaskName = 'Meeting with ' + meetingWith;
@@ -571,7 +577,12 @@ async function createOutreachFollowupSubtask(parentTaskId, params) {
     description: descLines.join('\n'),
     parent: parentTaskId,
     due_date: dueDateMs,
-    due_date_time: false
+    due_date_time: false,
+    // When the meeting is with someone in TEAM_MEMBER_IDS, assign the subtask
+    // to them. ClickUp sends them a notification, the task lands in their
+    // queue. If meeting_with isn't recognized (e.g. Matt for now), the task
+    // is created unassigned so it still surfaces in Neshel's queue.
+    ...(assigneeId ? { assignees: [assigneeId] } : {})
   };
   return clickupRequest('POST', `/list/${PARTNER_LIST_ID}/task`, payload);
 }
@@ -792,10 +803,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // POST outreach — create new partner outreach task. NEW IN 4.6: if the
+  // POST outreach — create new partner outreach task. Phase 4.6: if the
   // request includes next_action_date (and optionally meeting_with), we also
-  // create a subtask under the new partner task with that due date so it
-  // appears in Neshel's ClickUp queue automatically as a follow-up.
+  // create a subtask under the new partner task with that due date. When
+  // meeting_with maps to a known team member in TEAM_MEMBER_IDS, the subtask
+  // is assigned to them (triggers a ClickUp notification).
   if (req.method === 'POST' && url === '/outreach') {
     try {
       const body = await parseBody(req);
@@ -813,7 +825,7 @@ const server = http.createServer(async (req, res) => {
       const partner_type = safeText(body.partner_type, 100);
       const last_touch   = safeInt(body.last_touch, 0, 9999999999999);
       const status       = safeEnum(body.status, ['Cold','Scheduled','Active','Dormant','Closed']);
-      // New 4.6 fields — both optional. If next_action_date is set we'll
+      // Phase 4.6 fields — both optional. If next_action_date is set we'll
       // create a follow-up subtask after the partner task is created.
       const next_action_date = safeInt(body.next_action_date, 0, 9999999999999);
       const meeting_with     = safeText(body.meeting_with, 100);
@@ -847,11 +859,14 @@ const server = http.createServer(async (req, res) => {
       let followupResult = null;
       if (next_action_date && result.id) {
         try {
+          const assigneeId = (meeting_with && TEAM_MEMBER_IDS[meeting_with]) || null;
+          console.log(`Creating follow-up subtask: meeting_with=${meeting_with || '(none)'} assigneeId=${assigneeId || '(none)'} dueDate=${next_action_date}`);
           followupResult = await createOutreachFollowupSubtask(result.id, {
             actionLabel: next_action,
             dueDateMs: next_action_date,
             meetingWith: meeting_with || null,
-            partnerName: partner_name
+            partnerName: partner_name,
+            assigneeId: assigneeId
           });
           if (followupResult && (followupResult.err || followupResult.errors)) {
             console.error('Follow-up subtask rejected:', JSON.stringify(followupResult).slice(0, 200));
@@ -1139,7 +1154,8 @@ const server = http.createServer(async (req, res) => {
       status: 'ok',
       service: 'Bright Horizons Command Center API',
       token_set: !!API_TOKEN,
-      anthropic_set: !!ANTHROPIC_API_KEY
+      anthropic_set: !!ANTHROPIC_API_KEY,
+      version: 'v13'
     }));
     return;
   }
@@ -1149,7 +1165,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Bright Horizons API running on port ${PORT}`);
+  console.log(`Bright Horizons API v13 running on port ${PORT}`);
   if (!API_TOKEN) console.warn('WARNING: CLICKUP_API_TOKEN not set');
   if (!DASHBOARD_TOKEN) console.warn('WARNING: DASHBOARD_TOKEN not set — auth enforcement DISABLED');
   else console.log('Auth enabled — DASHBOARD_TOKEN required on all routes except /health');
